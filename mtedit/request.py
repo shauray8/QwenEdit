@@ -24,6 +24,11 @@ class MaskSpec:
     feather_px: float = 16.0
     # grow each box by this many target pixels before rasterizing
     grow_px: float = 0.0
+    # draw the boxes onto the canvas reference the model sees (Qwen-Image 2.1's native
+    # mark-guided local editing); the kept outside still comes from the clean latents
+    annotate: bool = False
+    mark_color: tuple[int, int, int] = (255, 0, 0)
+    mark_width_px: float = 6.0
 
 
 @dataclass
@@ -46,6 +51,9 @@ class MTRequest:
                 canvas_ref=int(mask.get("canvas_ref", 0)),
                 feather_px=float(mask.get("feather_px", 16.0)),
                 grow_px=float(mask.get("grow_px", 0.0)),
+                annotate=bool(mask.get("annotate", False)),
+                mark_color=tuple(int(c) for c in mask.get("mark_color", (255, 0, 0))),
+                mark_width_px=float(mask.get("mark_width_px", 6.0)),
             )
             if mask
             else None,

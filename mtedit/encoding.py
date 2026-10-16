@@ -41,29 +41,23 @@ MASK_EXTRA_KEY = "mt_mask"
 
 
 class MTCaches(list):
-    """``prefix_caches`` for one branch, carrying the per-sample segment chains."""
+    """``prefix_caches`` for one branch, carrying each sample's virtual token ids."""
 
-    def __init__(self, caches, chains, prefix_lengths):
+    def __init__(self, caches, vids, prefix_lengths):
         super().__init__(caches)
-        self.chains = chains  # per sample: list[(start, end, key)] or None
+        self.vids = vids  # per sample: int64 array over prefix positions, or None
         self.prefix_lengths = prefix_lengths
         self.prepared = False
-        self.reused_from: list[int] = [0] * len(caches)  # per sample: first segment not from the store
+        self.matches: list = []  # pool locks held until the request finishes
+        self.stored = [False] * len(caches)  # sample's prefix already in the pool
 
+    def release(self) -> None:
+        for match in self.matches:
+            match.release()
+        self.matches.clear()
 
-def _root_key(server_args) -> bytes:
-    try:
-        from sglang.multimodal_gen.runtime.cache.conditioning import conditioning_weights_epoch
-
-        epoch = conditioning_weights_epoch()
-    except Exception:  # older/newer sglang without the epoch counter
-        epoch = None
-    return keys.root_key(
-        server_args.model_path,
-        getattr(server_args, "component_quantizations", None),
-        getattr(server_args, "transformer_quantization", None),
-        epoch,
-    )
+    def __del__(self):  # a request that died mid-loop must not pin pool slots
+        self.release()
 
 
 def _collapsed_ids(stage, prompt, num_images):
@@ -97,8 +91,16 @@ def encoding_forward(self, batch, server_args):
         resized.append(image.convert(image_mode).resize((width, height), Image.Resampling.LANCZOS))
         shapes.append((1, height // 16, width // 16))
 
+    # mt: region edits draw the boxes onto the canvas the model sees (mark-guided local editing)
+    clean_source = None
+    if mt.mask is not None and mt.mask.annotate and 0 <= mt.mask.canvas_ref < len(resized):
+        index = mt.mask.canvas_ref
+        clean_source = (index, resized[index], mt.ref_latents.pop(index, None))
+        resized[index] = annotate(resized[index], mt.mask)
+
     # mt: condition latents from a stored output, then the VAE cache, then the VAE
-    image_keys: list[bytes] = []
+    image_keys: list[bytes] = []  # what the DiT sees: latent id or pixels
+    pixel_keys = [keys.image_content_key(image) for image in resized]  # what the text encoder sees
     conditions = [None] * len(resized)
     to_encode = []
     for index, image in enumerate(resized):
@@ -110,7 +112,7 @@ def encoding_forward(self, batch, server_args):
             continue
         if latent_id:
             logger.warning("mtedit: latent %s missing or wrong shape; VAE-encoding reference %d", latent_id, index)
-        content = keys.image_content_key(image)
+        content = pixel_keys[index]
         image_keys.append(content)
         cached = state.VAE_LATENTS.get(content)
         if cached is not None:
@@ -119,20 +121,21 @@ def encoding_forward(self, batch, server_args):
             to_encode.append((index, image, content))
 
     if to_encode:
-        with self.use_declared_component(component_name="vae", module=self.vae) as vae:
-            vae.use_tiling = config.vae_tiling
-            for index, image, content in to_encode:
-                pixels = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8).reshape(
-                    image.height, image.width, ac.in_channels
-                )
-                # preserve the reference's batch stride for identical cuDNN convolution rounding
-                pixels = pixels[None].permute(0, 3, 1, 2).unsqueeze(2).float() / 255.0
-                pixels = (2 * pixels - 1).to(device=device, dtype=torch.bfloat16)
-                latent = vae.encode(pixels).mode()
-                mean = latent.new_tensor(ac.latents_mean).view(1, ac.z_dim, 1, 1, 1)
-                std = latent.new_tensor(ac.latents_std).view(1, ac.z_dim, 1, 1, 1)
-                conditions[index] = ((latent - mean) / std).flatten(2).transpose(1, 2)
-                state.VAE_LATENTS.put(content, conditions[index])
+        _vae_encode(self, config, ac, device, to_encode, conditions)
+
+    clean = None
+    if clean_source is not None:  # mt: the mask keeps the unannotated canvas
+        index, image, latent_id = clean_source
+        stored = state.OUTPUT_LATENTS.get(latent_id) if latent_id else None
+        if stored is not None and stored.shape[1] == shapes[index][1] * shapes[index][2]:
+            clean = stored.to(device=device, dtype=torch.bfloat16)
+        else:
+            content = keys.image_content_key(image)
+            clean = state.VAE_LATENTS.get(content)
+            if clean is None:
+                out = [None]
+                _vae_encode(self, config, ac, device, [(0, image, content)], out)
+                clean = out[0]
 
     shapes.append((1, batch.height // 16, batch.width // 16))
     prompts = batch.prompt if isinstance(batch.prompt, list) else [batch.prompt]
@@ -147,22 +150,22 @@ def encoding_forward(self, batch, server_args):
     )
 
     use_store = state.PREFIX_CACHE and mt.prefix_cache and _store_supported(server_args)  # mt
-    root = _root_key(server_args) if use_store else None
+    root = state.dit_root(server_args) if use_store else None
     image_shapes = [(h, w) for _, h, w in shapes[:-1]]
 
     for negative in [False, True] if batch.do_classifier_free_guidance else [False]:
-        embeds, masks, layouts, chains = [], [], [], []
+        embeds, masks, layouts, all_vids = [], [], [], []
         for prompt in negatives if negative else prompts:
             with set_forward_context(current_timestep=None, attn_metadata=None, forward_batch=batch):
-                hidden, slots = self.encode_prompt(prompt, resized, device)
+                hidden, slots = _encode_prompt(self, prompt, resized, device, pixel_keys, mt)  # mt
             layout = build_layout(slots.tolist(), shapes, config.dit_config.axes_dims_rope, device)
-            chain = None
+            vids = None
             if use_store:  # mt
-                chain = _chain_for(self, root, prompt, layout, hidden, image_keys, image_shapes)
+                vids = _vids_for(self, root, prompt, layout, hidden, image_keys, image_shapes)
             for _ in range(batch.num_outputs_per_prompt):
                 embeds.append(hidden)
                 layouts.append(layout)
-                chains.append(chain)
+                all_vids.append(vids)
         max_length = max(x.shape[0] for x in embeds)
         for x in embeds:
             masks.append(torch.arange(max_length, device=device) < x.shape[0])
@@ -180,7 +183,7 @@ def encoding_forward(self, batch, server_args):
             batch.prompt_seq_lens = [mask.sum(1).tolist()]
         caches = [[{} for _ in range(config.dit_config.num_layers)] for _ in range(sample_count)]
         if use_store:  # mt
-            caches = MTCaches(caches, chains, [l["prefix_rope"].shape[0] for l in layouts])
+            caches = MTCaches(caches, all_vids, [l["prefix_rope"].shape[0] for l in layouts])
         batch.extra["qwen21_negative" if negative else "qwen21_positive"] = dict(
             layouts=layouts,
             condition_latents=condition_latents,
@@ -188,7 +191,7 @@ def encoding_forward(self, batch, server_args):
         )
 
     if mt.mask is not None:  # mt
-        _prepare_mask(batch, mt, conditions, shapes)
+        _prepare_mask(batch, mt, conditions, shapes, clean)
 
     sched = self.scheduler.config
     batch.extra["qwen21_mu"] = calculate_linear_shift(
@@ -210,7 +213,22 @@ def _store_supported(server_args) -> bool:
     )
 
 
-def _chain_for(stage, root, prompt, layout, hidden, image_keys, image_shapes):
+def _encode_prompt(stage, prompt, images, device, pixel_keys, mt):
+    """``stage.encode_prompt`` with text-encoder prefix reuse (falls back to upstream)."""
+    if not (state.ENCODER_CACHE and mt.prefix_cache):
+        return stage.encode_prompt(prompt, images, device)
+    from mtedit.encoder_cache import encode_prompt_cached
+
+    try:
+        result = encode_prompt_cached(stage, prompt, images, device, pixel_keys)
+    except Exception:
+        logger.exception("mtedit: encoder cache failed; using the upstream encoder")
+        return stage.encode_prompt(prompt, images, device)
+    stage.finish_unused_declared_component(component_name="text_encoder", module=stage.text_encoder)
+    return result
+
+
+def _vids_for(stage, root, prompt, layout, hidden, image_keys, image_shapes):
     ids = _collapsed_ids(stage, prompt, len(image_keys))
     if len(ids) != hidden.shape[0] or len(ids) != layout["encoder_seq_len"]:
         logger.warning(
@@ -219,7 +237,7 @@ def _chain_for(stage, root, prompt, layout, hidden, image_keys, image_shapes):
             hidden.shape[0],
         )
         return None
-    return keys.segment_chain(
+    return keys.virtual_ids(
         root,
         layout["segments"],
         layout["text_indices"].tolist(),
@@ -229,7 +247,38 @@ def _chain_for(stage, root, prompt, layout, hidden, image_keys, image_shapes):
     )
 
 
-def _prepare_mask(batch, mt, conditions, shapes):
+def _vae_encode(self, config, ac, device, items, conditions):
+    """Upstream's per-reference VAE encode; results go to ``conditions[index]`` and the VAE cache."""
+    with self.use_declared_component(component_name="vae", module=self.vae) as vae:
+        vae.use_tiling = config.vae_tiling
+        for index, image, content in items:
+            pixels = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8).reshape(
+                image.height, image.width, ac.in_channels
+            )
+            # preserve the reference's batch stride for identical cuDNN convolution rounding
+            pixels = pixels[None].permute(0, 3, 1, 2).unsqueeze(2).float() / 255.0
+            pixels = (2 * pixels - 1).to(device=device, dtype=torch.bfloat16)
+            latent = vae.encode(pixels).mode()
+            mean = latent.new_tensor(ac.latents_mean).view(1, ac.z_dim, 1, 1, 1)
+            std = latent.new_tensor(ac.latents_std).view(1, ac.z_dim, 1, 1, 1)
+            conditions[index] = ((latent - mean) / std).flatten(2).transpose(1, 2)
+            state.VAE_LATENTS.put(content, conditions[index])
+
+
+def annotate(image, spec):
+    """The canvas with each box outlined (inside the box, so the outline is regenerated)."""
+    from PIL import ImageDraw
+
+    out = image.copy()
+    draw = ImageDraw.Draw(out)
+    width = max(1, int(round(spec.mark_width_px)))
+    color = tuple(spec.mark_color) + ((255,) if out.mode == "RGBA" else ())
+    for x0, y0, x1, y1 in spec.boxes:
+        draw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=color, width=width)
+    return out
+
+
+def _prepare_mask(batch, mt, conditions, shapes, clean=None):
     spec = mt.mask
     target = shapes[-1]
     if not (0 <= spec.canvas_ref < len(conditions)):
@@ -240,7 +289,8 @@ def _prepare_mask(batch, mt, conditions, shapes):
             f"({shapes[spec.canvas_ref][1:]} latent vs target {target[1:]})"
         )
     editable = rasterize(spec, batch.height, batch.width)
+    source = clean if clean is not None else conditions[spec.canvas_ref]
     batch.extra[MASK_EXTRA_KEY] = MaskState(
-        x0=conditions[spec.canvas_ref][:1],
-        editable=editable.view(1, -1, 1).to(conditions[spec.canvas_ref].device),
+        x0=source[:1],
+        editable=editable.view(1, -1, 1).to(source.device),
     )

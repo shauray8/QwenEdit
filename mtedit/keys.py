@@ -43,32 +43,81 @@ def latent_key(latent_id: str) -> bytes:
     return _h(b"lat", latent_id.encode())
 
 
-def segment_chain(
+MASK63 = (1 << 63) - 1
+_GOLDEN = np.uint64(0x9E3779B97F4A7C15)
+
+
+def _as_int(digest: bytes) -> int:
+    return int.from_bytes(digest[:8], "little") & MASK63
+
+
+def _splitmix(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.uint64)
+    with np.errstate(over="ignore"):
+        x = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+        x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+        x = x ^ (x >> np.uint64(31))
+    return (x & np.uint64(MASK63)).astype(np.int64)
+
+
+def _block_ids(prev: int, content: bytes, n: int) -> np.ndarray:
+    """``n`` ids for one image block: all depend on the block content and everything before it."""
+    base = np.uint64(_as_int(_h(prev.to_bytes(8, "little"), b"B", content)))
+    with np.errstate(over="ignore"):
+        return _splitmix(base + np.arange(n, dtype=np.uint64) * _GOLDEN)
+
+
+def _text_id(prev: int, token: int) -> int:
+    return _as_int(_h(prev.to_bytes(8, "little"), b"t", int(token).to_bytes(8, "little", signed=True)))
+
+
+def virtual_ids(
     root: bytes,
     segments: Sequence[tuple[int, int, bool]],
     text_indices: Sequence[int],
     ids: Sequence[int],
     image_keys: Sequence[bytes],
     image_shapes: Sequence[tuple[int, int]],
-) -> list[tuple[int, int, bytes]]:
-    """Chained keys for ``layout["segments"]``.
+) -> np.ndarray:
+    """One chained id per DiT prefix position (``int64``), for the paged radix store.
 
-    ``text_indices[p]`` maps prefix position ``p`` to its row in the collapsed
-    encoder sequence, whose token ids are ``ids``; image segments consume
-    ``image_keys`` in order. ``image_shapes`` are the latent (h, w) per image.
+    Text positions chain per token (causal, so any shared head is reusable);
+    an image block's ids all derive from its content key and the chain before
+    it, so blocks match whole or not at all.
     """
-    chain, key, image = [], root, 0
+    total = segments[-1][1] if segments else 0
+    out = np.empty(total, np.int64)
+    prev, image = _as_int(root), 0
     for start, end, is_image in segments:
         if is_image:
             h, w = image_shapes[image]
             if (end - start) != h * w:
                 raise ValueError("image segment length does not match its latent shape")
-            key = _h(key, b"I", image_keys[image], np.asarray([h, w], np.int64).tobytes())
+            content = image_keys[image] + np.asarray([h, w], np.int64).tobytes()
+            out[start:end] = _block_ids(prev, content, end - start)
+            prev = int(out[end - 1])
             image += 1
         else:
-            rows = np.asarray([ids[i] for i in text_indices[start:end]], np.int64)
-            key = _h(key, b"T", rows.tobytes())
-        chain.append((start, end, key))
+            for position in range(start, end):
+                prev = _text_id(prev, ids[text_indices[position]])
+                out[position] = prev
     if image != len(image_keys):
         raise ValueError("image segments do not match the reference images")
-    return chain
+    return out
+
+
+def sequence_ids(root: bytes, token_ids: Sequence[int], image_runs: Sequence[tuple[int, int, bytes]]) -> np.ndarray:
+    """Chained ids for a causal token sequence whose image-pad runs ``(start, end, key)`` carry content keys."""
+    out = np.empty(len(token_ids), np.int64)
+    prev, position = _as_int(root), 0
+    for start, end, key in sorted(image_runs):
+        for p in range(position, start):
+            prev = _text_id(prev, token_ids[p])
+            out[p] = prev
+        out[start:end] = _block_ids(prev, key, end - start)
+        prev = int(out[end - 1]) if end > start else prev
+        position = end
+    for p in range(position, len(token_ids)):
+        prev = _text_id(prev, token_ids[p])
+        out[p] = prev
+    return out

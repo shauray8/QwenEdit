@@ -24,6 +24,13 @@ from PIL import Image, ImageDraw, ImageFilter
 
 Box = tuple[float, float, float, float]
 
+# Boxed edits: the worker outlines the boxes in red on the canvas the model sees
+# (Qwen-Image 2.1's mark-guided local editing) and the prompt names the mark.
+BOX_TEMPLATE = (
+    "Edit only the area inside the red box: {instruction} "
+    "Remove the red box outline completely and keep everything outside the box unchanged."
+)
+
 ANCHOR_TEMPLATE = (
     "<image1> is the original image and <image2> is its current edited version. "
     "Edit <image2>: {instruction} Keep everything else in <image2> unchanged."
@@ -111,6 +118,9 @@ class EditSession:
         steps: int | None = None,
         guidance_scale: float | None = None,
         session_id: str | None = None,
+        cache: bool = True,
+        mark_boxes: bool = True,
+        box_template: str | None = None,
     ):
         if layout not in ("chain", "anchor"):
             raise ValueError("layout must be 'chain' or 'anchor'")
@@ -121,6 +131,9 @@ class EditSession:
         self.paste_back = paste_back
         self.steps = steps
         self.guidance_scale = guidance_scale
+        self.cache = cache  # False: no prefix/encoder reuse (reference runs)
+        self.mark_boxes = mark_boxes
+        self.box_template = box_template or BOX_TEMPLATE
         self.id = session_id or uuid.uuid4().hex[:8]
         self.dir = os.path.join(engine.out_dir, f"session_{self.id}")
         os.makedirs(self.dir, exist_ok=True)
@@ -185,16 +198,21 @@ class EditSession:
             refs = [self.versions[self.root], parent]
         canvas_ref = len(refs) - 1
         template = self.template if len(refs) == 2 else "{instruction}"
-        prompt = template.format(instruction=instruction.strip())
+        instruction = instruction.strip()
+        task = self.box_template.format(instruction=instruction) if boxes and self.mark_boxes else instruction
+        prompt = template.format(instruction=task)
 
         self._counter += 1
         vid = f"v{self._counter:03d}"
         latent_id = f"{self.id}/{vid}"
-        mt: dict = {"store_output_as": latent_id}
+        mt: dict = {"store_output_as": latent_id, "prefix_cache": self.cache}
         if self.passthrough:
             mt["ref_latents"] = {i: r.latent_id for i, r in enumerate(refs) if r.latent_id}
         if boxes:
-            mt["mask"] = {"boxes": [list(b) for b in boxes], "canvas_ref": canvas_ref, "feather_px": feather_px, "grow_px": grow_px}
+            mt["mask"] = {
+                "boxes": [list(b) for b in boxes], "canvas_ref": canvas_ref, "feather_px": feather_px,
+                "grow_px": grow_px, "annotate": self.mark_boxes,
+            }
         seed = int(time.time_ns() % (2**31)) if seed is None else seed
 
         start = time.perf_counter()

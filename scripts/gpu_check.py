@@ -50,12 +50,14 @@ def main():
     ap.add_argument("--out", default="/workspace/mt/check")
     ap.add_argument("--size", type=int, default=1024)
     ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument("--int8", action="store_true", help="online INT8 ConvRot DiT (needs CUDA_HOME at CUDA 13)")
     args = ap.parse_args()
 
     from mtedit.session import Engine, EditSession
 
     os.makedirs(args.out, exist_ok=True)
-    engine = Engine(args.model, out_dir=args.out)
+    extra = {"component_quantizations": {"transformer": "convrot_int8"}} if args.int8 else {}
+    engine = Engine(args.model, out_dir=args.out, **extra)
     size = args.size
     src_path = os.path.join(args.out, "src.png")
     Image.open(args.image).convert("RGB").resize((size, size), Image.Resampling.LANCZOS).save(src_path)

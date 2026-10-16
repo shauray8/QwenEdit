@@ -58,19 +58,21 @@ def _predict_noise_impl(original, self, current_model, latent_model_input, times
     if not isinstance(caches, MTCaches) or caches.prepared:
         return original(self, current_model, latent_model_input, timestep, target_dtype, guidance, **kwargs)
     caches.prepared = True  # once per branch per request: the first step's call
+    model = prefill.unwrap(current_model)
     try:
-        _fill_from_store(prefill.unwrap(current_model), caches, kwargs)
+        pending = _fill_from_pool(model, caches, kwargs)
     except Exception:
-        logger.exception("mtedit: prefix store lookup failed; falling back to a full prefill")
+        logger.exception("mtedit: prefix pool lookup failed; falling back to a full prefill")
+        caches.release()
         for sample in range(len(caches)):
-            caches.reused_from[sample] = 0
             for layer in caches[sample]:
                 layer.clear()
+        pending = [i for i, v in enumerate(caches.vids) if v is not None]
     out = original(self, current_model, latent_model_input, timestep, target_dtype, guidance, **kwargs)
     try:
-        _insert_into_store(caches)
+        _store_computed(model, caches, pending)
     except Exception:
-        logger.exception("mtedit: prefix store insert failed")
+        logger.exception("mtedit: prefix pool insert failed")
     return out
 
 
@@ -79,57 +81,67 @@ def _encoder_hidden_states(kwargs):
     return ehs[0] if isinstance(ehs, list) else ehs
 
 
-def _fill_from_store(model, caches: MTCaches, kwargs) -> None:
+def _set_caches(caches, sample, kv) -> None:
+    for layer in range(kv.shape[0]):
+        caches[sample][layer].update(key=kv[layer, 0][None], value=kv[layer, 1][None])
+
+
+def _fill_from_pool(model, caches: MTCaches, kwargs) -> list[int]:
+    """Fill each sample's prefix K/V from the pool; return the samples the DiT must prefill itself."""
+    pool = state.dit_pool(model)
     layouts = kwargs["layouts"]
-    layers, heads, head_dim = prefill.kv_geometry(model)
-    device = model.img_in.weight.device
-    t0 = time.perf_counter()
-    for sample, chain in enumerate(caches.chains):
-        if chain is None:
+    pending = []
+    for sample, vids in enumerate(caches.vids):
+        if vids is None:
             continue
-        nodes = state.STORE.match([key for _, _, key in chain], device)
+        t0 = time.perf_counter()
         total = caches.prefix_lengths[sample]
-        if not nodes:
-            state.STORE.record(0, total)
-            continue  # a full miss: the DiT's own fused prefill is faster
-        start = chain[len(nodes) - 1][1]
-        kv = torch.empty(layers, 2, total, heads, head_dim, device=device, dtype=nodes[0].kv.dtype)
-        for node, (s, e, _) in zip(nodes, chain):
-            kv[:, :, s:e].copy_(node.kv, non_blocking=True)
-        if start < total:
+        match = pool.match(vids)
+        m = match.length
+        if m == total:
+            # full hit: the pool slots themselves (a view when contiguous); held until the request ends
+            _set_caches(caches, sample, pool.gather(match.indices))
+            caches.matches.append(match)
+        elif m >= state.MIN_REUSE:
+            kv = torch.empty(pool.layers, 2, total, pool.heads, pool.head_dim, device=pool.kv.device, dtype=pool.kv.dtype)
+            kv[:, :, :m] = pool.gather(match.indices)
             prefix = prefill.prefix_inputs(
                 model, _encoder_hidden_states(kwargs), layouts[sample], kwargs.get("condition_latents"), sample
             )
-            prefill.prefill_from(model, prefix, layouts[sample], kv, start)
-        for layer in range(layers):
-            caches[sample][layer].update(key=kv[layer, 0][None], value=kv[layer, 1][None])
-        caches.reused_from[sample] = len(nodes)
-        state.STORE.record(start, total - start)
+            prefill.prefill_from(model, prefix, layouts[sample], kv, m)
+            _set_caches(caches, sample, kv)
+            slots = pool.alloc(total - m)
+            if slots is not None:
+                pool.write(slots, kv[:, :, m:])
+                pool.insert(vids, torch.cat([match.indices, slots]), owned_from=m)
+            match.release()
+        else:
+            match.release()
+            pending.append(sample)  # the DiT's own fused prefill; stored after its first call
+            m = 0
         if state.DEBUG:
             logger.info(
-                "mtedit: sample %d reused %d/%d prefix tokens (%d/%d segments) in %.1f ms",
-                sample, start, total, len(nodes), len(chain), (time.perf_counter() - t0) * 1e3,
+                "mtedit: dit sample %d reused %d/%d prefix tokens in %.1f ms (pool %s)",
+                sample, m, total, (time.perf_counter() - t0) * 1e3,
+                {k: v for k, v in pool.usage().items() if k in ("free", "evictable", "contiguous_views", "gathers")},
             )
+    return pending
 
 
-def _insert_into_store(caches: MTCaches) -> None:
-    protect = set()
-    for sample, chain in enumerate(caches.chains):
-        if chain is None or not caches[sample][0]:
+def _store_computed(model, caches: MTCaches, pending: list[int]) -> None:
+    pool = state.dit_pool(model)
+    for sample in pending:
+        layers = caches[sample]
+        if not layers[0]:
             continue
-        keys_ = [layer["key"][0] for layer in caches[sample]]
-        values = [layer["value"][0] for layer in caches[sample]]
-        parent = None
-        for index, (s, e, key) in enumerate(chain):
-            node = state.STORE.nodes.get(key)
-            if node is None:
-                kv = torch.stack(
-                    [torch.stack([k[s:e], v[s:e]]) for k, v in zip(keys_, values)]
-                )  # a fresh [layers, 2, n, H, D] copy, independent of the request buffers
-                node = state.STORE.insert(parent, key, kv)
-            parent = node
-            protect.add(key)
-    state.STORE.enforce_budgets(protect)
+        total = caches.prefix_lengths[sample]
+        slots = pool.alloc(total)
+        if slots is None:
+            continue
+        for index, layer in enumerate(layers):
+            pool.kv[index, 0].index_copy_(0, slots, layer["key"][0])
+            pool.kv[index, 1].index_copy_(0, slots, layer["value"][0])
+        pool.insert(caches.vids[sample], slots, owned_from=0)
 
 
 # _run_denoising_step: latent mask --------------------------------------------------
@@ -181,4 +193,8 @@ def post_denoising_loop_around(original, self, latents, batch):
             name = mt.store_output_as if index == 0 else f"{mt.store_output_as}#{index}"
             state.OUTPUT_LATENTS.put(name, latents[index : index + 1].detach().to(torch.bfloat16).clone())
     batch.extra.pop(MASK_EXTRA_KEY, None)
+    for branch in ("qwen21_positive", "qwen21_negative"):
+        caches = (batch.extra.get(branch) or {}).get("prefix_caches")
+        if isinstance(caches, MTCaches):
+            caches.release()
     return original(self, latents, batch)

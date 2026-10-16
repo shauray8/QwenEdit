@@ -4,7 +4,6 @@ import torch
 from PIL import Image
 
 from mtedit import keys
-from mtedit.kvstore import PrefixKVStore
 from mtedit.masking import MaskState, rasterize
 from mtedit.request import MaskSpec, MTRequest
 
@@ -15,22 +14,6 @@ IDS_A = [10, 11, 12, 99, 20, 21]
 IDS_B = [10, 11, 12, 99, 30, 31]
 
 
-def chain(ids, image=b"img1"):
-    return keys.segment_chain(b"root", SEGMENTS, TEXT_INDICES, ids, [image], [(2, 2)])
-
-
-def test_chain_shares_prefix_until_first_difference():
-    a, b = chain(IDS_A), chain(IDS_B)
-    assert [k for *_, k in a[:2]] == [k for *_, k in b[:2]]
-    assert a[2][2] != b[2][2]
-    assert chain(IDS_A, b"img2")[1][2] != a[1][2]  # different image: same text before it, new key after
-    assert chain(IDS_A, b"img2")[0][2] == a[0][2]
-
-
-def test_chain_depends_on_root():
-    assert keys.segment_chain(b"other", SEGMENTS, TEXT_INDICES, IDS_A, [b"img1"], [(2, 2)])[0][2] != chain(IDS_A)[0][2]
-
-
 def test_image_key_sees_pixels_and_size():
     a = Image.new("RGB", (32, 32), (1, 2, 3))
     b = Image.new("RGB", (32, 32), (1, 2, 4))
@@ -39,35 +22,31 @@ def test_image_key_sees_pixels_and_size():
     assert keys.image_content_key(a) != keys.image_content_key(a.resize((64, 16)))
 
 
-def _kv(tokens, fill=0.0):
-    return torch.full((2, 2, tokens, 1, 4), fill)
+def vids(ids, image=b"img1"):
+    return keys.virtual_ids(b"root", SEGMENTS, TEXT_INDICES, ids, [image], [(2, 2)])
 
 
-def test_store_match_insert_and_branching():
-    store = PrefixKVStore(gpu_budget=1 << 30, cpu_budget=1 << 30)
-    a, b = [k for *_, k in chain(IDS_A)], [k for *_, k in chain(IDS_B)]
-    parent = None
-    for key, (s, e, _) in zip(a, SEGMENTS):
-        parent = store.insert(parent, key, _kv(e - s))
-    assert len(store.match(a, torch.device("cpu"))) == 3
-    matched = store.match(b, torch.device("cpu"))
-    assert len(matched) == 2  # shares text + image, differs in the final text
-    store.insert(matched[-1], b[2], _kv(2, 1.0))
-    assert len(store.match(b, torch.device("cpu"))) == 3
-    assert len(store.nodes) == 4
+def test_virtual_ids_share_head_and_split_at_first_difference():
+    a, b = vids(IDS_A), vids(IDS_B)
+    assert (a[:7] == b[:7]).all()  # text + image identical
+    assert a[7] != b[7] and a[8] != b[8]
+    assert len(set(a.tolist())) == len(a)
 
 
-def test_store_drops_subtree_over_cpu_budget():
-    one = _kv(4).numel() * 4
-    store = PrefixKVStore(gpu_budget=0, cpu_budget=2 * one)
-    a = [k for *_, k in chain(IDS_A)]
-    n0 = store.insert(None, a[0], _kv(4))
-    n1 = store.insert(n0, a[1], _kv(4))
-    store.insert(n1, a[2], _kv(4))
-    n0.last_used = 0  # oldest: dropping it takes its whole subtree
-    store.enforce_budgets()
-    assert store.match(a, torch.device("cpu")) == []
-    assert not store.nodes
+def test_virtual_ids_image_block_matches_whole_or_not_at_all():
+    a, c = vids(IDS_A), vids(IDS_A, b"img2")
+    assert (a[:3] == c[:3]).all()
+    assert not (a[3:7] == c[3:7]).any()  # every block position differs, so no partial block match
+    assert not (a[7:] == c[7:]).any()
+
+
+def test_sequence_ids_chain_over_image_runs():
+    toks = [1, 2, 99, 99, 99, 3, 4]
+    a = keys.sequence_ids(b"r", toks, [(2, 5, b"x")])
+    b = keys.sequence_ids(b"r", toks, [(2, 5, b"y")])
+    c = keys.sequence_ids(b"r", toks[:5] + [3, 5], [(2, 5, b"x")])
+    assert (a[:2] == b[:2]).all() and not (a[2:] == b[2:]).any()
+    assert (a[:6] == c[:6]).all() and a[6] != c[6]
 
 
 def test_rasterize_box_is_one_inside_zero_far_outside():

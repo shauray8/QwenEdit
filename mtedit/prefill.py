@@ -56,9 +56,11 @@ def prefill_from(model, prefix, layout, kv: torch.Tensor, start: int) -> None:
     )
     scale1, gate1, scale2, gate2 = model.prepare_modulation(zero_temb)
     rope = layout["prefix_rope"][start:]
-    segments = [(s, e, img) for s, e, img in layout["segments"] if e > start]
-    if segments and segments[0][0] < start:
-        raise ValueError("cached prefix must end on a segment boundary")
+    segments = [(max(s, start), e, img) for s, e, img in layout["segments"] if e > start]
+    for (s, _, is_image), (s0, _, _) in zip(segments, [g for g in layout["segments"] if g[1] > start]):
+        if is_image and s0 < start:
+            raise ValueError("cached prefix ends inside an image block")  # block ids prevent this
+    # a text segment may start mid-run: causal rows only need keys up to themselves
     x = prefix[:, start:]
     blocks = model.transformer_blocks
     for layer, block in enumerate(blocks):
