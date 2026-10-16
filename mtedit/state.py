@@ -59,6 +59,23 @@ class LRU:
 _slots = int(os.environ.get("MTEDIT_LATENT_SLOTS", 512))
 # latent id -> [1, HW, C] final latents of a stored output (normalized, packed, on GPU)
 OUTPUT_LATENTS = LRU(_slots)
+# latent id -> (h, w) latent grid of the stored output
+OUTPUT_GRID: dict[str, tuple[int, int]] = {}
+
+
+def stored_latents(latent_id, crop=None):
+    """A stored output's latents, optionally a (x0, y0, x1, y1) window in latent cells; None if absent."""
+    latents = OUTPUT_LATENTS.get(latent_id) if latent_id else None
+    if latents is None or crop is None:
+        return latents
+    grid = OUTPUT_GRID.get(latent_id)
+    if grid is None:
+        return None
+    x0, y0, x1, y1 = crop
+    h, w = grid
+    if not (0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h):
+        return None
+    return latents.view(1, h, w, -1)[:, y0:y1, x0:x1].reshape(1, (y1 - y0) * (x1 - x0), -1)
 # image content key -> [1, HW, C] VAE condition latents
 VAE_LATENTS = LRU(_slots)
 

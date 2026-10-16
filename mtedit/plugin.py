@@ -55,6 +55,12 @@ def _predict_noise(original, *args, **kwargs):
     return predict_noise_around(original, *args, **kwargs)
 
 
+def _input_validation(original, *args, **kwargs):
+    from mtedit.hooks import input_validation_around
+
+    return input_validation_around(original, *args, **kwargs)
+
+
 def _run_denoising_step(original, *args, **kwargs):
     from mtedit.hooks import run_denoising_step_around
 
@@ -72,6 +78,7 @@ def register() -> None:
 
     HookRegistry.register(f"{STAGES}.QwenImage21EncodingStage.forward", _encoding_forward, HookType.AROUND)
     HookRegistry.register(f"{STAGES}.QwenImage21DenoisingStage._predict_noise", _predict_noise, HookType.AROUND)
+    HookRegistry.register(f"{STAGES}.QwenImage21InputValidationStage.forward", _input_validation, HookType.AROUND)
     HookRegistry.register(
         f"{STAGES}.QwenImage21DenoisingStage._run_denoising_step", _run_denoising_step, HookType.AROUND
     )

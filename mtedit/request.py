@@ -43,6 +43,15 @@ class MTRequest:
     prefix_cache: bool = True
     # warm the prefix pools only: run the first denoising call (the prefill) and skip the rest
     prefill_only: bool = False
+    # reference index -> (x0, y0, x1, y1) in latent cells: use that window of its stored latents
+    ref_latent_crops: dict[int, tuple[int, int, int, int]] = field(default_factory=dict)
+    # crop edits: write this request's latents into a copy of ``base``'s full latents at ``box``
+    # (latent cells) and store the result as ``as``
+    compose: dict | None = None
+    # reference index -> latent id: keep that reference's clean condition latents for later passthrough
+    store_ref_as: dict[int, str] = field(default_factory=dict)
+    # explicit sigma schedule (e.g. a subset of Turbo's 8 distilled sigmas for a faster draft)
+    sigmas: list[float] | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MTRequest":
@@ -64,6 +73,10 @@ class MTRequest:
             else None,
             prefix_cache=bool(data.get("prefix_cache", True)),
             prefill_only=bool(data.get("prefill_only", False)),
+            ref_latent_crops={int(k): tuple(int(x) for x in v) for k, v in (data.get("ref_latent_crops") or {}).items()},
+            compose=data.get("compose"),
+            store_ref_as={int(k): str(v) for k, v in (data.get("store_ref_as") or {}).items()},
+            sigmas=[float(x) for x in data["sigmas"]] if data.get("sigmas") else None,
         )
 
     @classmethod

@@ -96,7 +96,7 @@ def encoding_forward(self, batch, server_args):
     clean_source = None
     if mt.mask is not None and mt.mask.annotate and 0 <= mt.mask.canvas_ref < len(resized):
         index = mt.mask.canvas_ref
-        clean_source = (index, resized[index], mt.ref_latents.pop(index, None))
+        clean_source = (index, resized[index], mt.ref_latents.pop(index, None), mt.ref_latent_crops.get(index))
         resized[index] = annotate(resized[index], mt.mask)
 
     # mt: condition latents from a stored output, then the VAE cache, then the VAE
@@ -106,10 +106,11 @@ def encoding_forward(self, batch, server_args):
     to_encode = []
     for index, image in enumerate(resized):
         latent_id = mt.ref_latents.get(index)
-        stored = state.OUTPUT_LATENTS.get(latent_id) if latent_id else None
+        crop = mt.ref_latent_crops.get(index)
+        stored = state.stored_latents(latent_id, crop)
         if stored is not None and stored.shape[1] == shapes[index][1] * shapes[index][2]:
             conditions[index] = stored.to(device=device, dtype=torch.bfloat16)
-            image_keys.append(keys.latent_key(latent_id))
+            image_keys.append(keys.latent_key(f"{latent_id}@{crop}" if crop else latent_id))
             continue
         if latent_id:
             logger.warning("mtedit: latent %s missing or wrong shape; VAE-encoding reference %d", latent_id, index)
@@ -123,11 +124,15 @@ def encoding_forward(self, batch, server_args):
 
     if to_encode:
         _vae_encode(self, config, ac, device, to_encode, conditions)
+    for index, name in mt.store_ref_as.items():  # mt: give a reference stored latents (e.g. an uploaded root)
+        if 0 <= index < len(conditions) and (clean_source is None or clean_source[0] != index):
+            state.OUTPUT_LATENTS.put(name, conditions[index][:1].to(torch.bfloat16))
+            state.OUTPUT_GRID[name] = shapes[index][1:]
 
     clean = None
     if clean_source is not None:  # mt: the mask keeps the unannotated canvas
-        index, image, latent_id = clean_source
-        stored = state.OUTPUT_LATENTS.get(latent_id) if latent_id else None
+        index, image, latent_id, crop = clean_source
+        stored = state.stored_latents(latent_id, crop)
         if stored is not None and stored.shape[1] == shapes[index][1] * shapes[index][2]:
             clean = stored.to(device=device, dtype=torch.bfloat16)
         else:

@@ -11,7 +11,7 @@ dependencies = ["pillow", "numpy"]
 
 [project.optional-dependencies]
 server = ["fastapi", "uvicorn", "python-multipart"]
-playground = ["gradio>=5", "gradio_image_annotation"]
+share = ["gradio>=5"]  # only for its share tunnel (--share)
 
 # Loaded by SGLang-Diffusion in every process (CLI, scheduler, GPU workers).
 [project.entry-points."sglang.multimodal_gen.plugins"]
@@ -21,4 +21,4 @@ mtedit = "mtedit.plugin:register"
 include = ["mtedit*"]
 
 [tool.setuptools.package-data]
-mtedit = ["playground.html"]
+mtedit = ["web/*.html"]

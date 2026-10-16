@@ -33,6 +33,14 @@ BOX_TEMPLATE = (
     "Remove the red box outline completely and keep everything outside the box unchanged."
 )
 
+# Turbo's distilled schedule and subsets of it (5 and 4 steps measured close to 8 on the photo suite)
+TURBO_SIGMAS = [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
+SPEED_PRESETS = {
+    "quality": None,  # the model's own schedule
+    "fast": [1.0, 0.926626, 0.845148, 0.704534, 0.414568],
+    "draft": [1.0, 0.89508, 0.704534, 0.414568],
+}
+
 # Multi-region edits: each box gets its own outline color and instruction.
 MARK_PALETTE = [
     ("red", (255, 0, 0)), ("blue", (0, 90, 255)), ("green", (0, 200, 60)), ("yellow", (255, 220, 0)),
@@ -60,24 +68,32 @@ class Version:
     latent_id: str | None = None  # worker-side final latents, for passthrough
     seconds: float = 0.0
     timings: dict = field(default_factory=dict)  # generate / post / save
+    prompt: str | None = None  # the exact prompt sent to the model
     children: list[str] = field(default_factory=list)
 
 
 class Engine:
     """One ``DiffGenerator`` (and its GPU worker) shared by any number of sessions."""
 
-    def __init__(self, model_path: str = "Qwen/Qwen-Image-2.1-Turbo", out_dir: str = "mt_out", **server_kwargs):
+    def __init__(self, model_path: str = "Qwen/Qwen-Image-2.1-Turbo", out_dir: str = "mt_out",
+                 attention: str | None = None, **server_kwargs):
         from sglang.multimodal_gen import DiffGenerator
 
         server_kwargs.setdefault("performance_mode", "speed")
         self.model_path = model_path
+        self.attention = attention  # default DiT attention override for every request
         self.out_dir = os.path.abspath(out_dir)
         os.makedirs(self.out_dir, exist_ok=True)
         self.generator = DiffGenerator.from_pretrained(model_path=model_path, **server_kwargs)
         self.lock = threading.Lock()  # one generation at a time (edits and background warm-ups)
 
-    def run(self, *, prompt, images, width, height, seed, mt, name, steps=None, guidance_scale=None, save=False):
-        """One generation; returns (PIL image, result). ``save=False`` keeps the output in memory."""
+    def run(self, *, prompt, images, width, height, seed, mt, name, steps=None, guidance_scale=None, save=False,
+            attention=None):
+        """One generation; returns (PIL image, result). ``save=False`` keeps the output in memory.
+
+        ``attention`` switches only the DiT's attention for this request (e.g. ``"sage_attn"``);
+        the text encoder keeps its backend.
+        """
         kwargs = dict(
             prompt=prompt,
             image_path=list(images) or None,
@@ -93,6 +109,9 @@ class Engine:
             kwargs["num_inference_steps"] = steps
         if guidance_scale is not None:
             kwargs["guidance_scale"] = guidance_scale
+        attention = attention or self.attention
+        if attention:
+            kwargs["attention_backend_override"] = attention
         with self.lock:
             result = self.generator.generate(sampling_params_kwargs=kwargs)
         result = result[0] if isinstance(result, list) else result
@@ -163,6 +182,11 @@ class EditSession:
         box_template: str | None = None,
         prewarm: bool = False,
         root_latent_id: str | None = None,
+        crop: bool = True,
+        crop_margin_px: int = 96,
+        crop_min_px: int = 512,
+        crop_max_frac: float = 0.55,
+        sigmas: list[float] | None = None,
     ):
         if layout not in ("chain", "anchor"):
             raise ValueError("layout must be 'chain' or 'anchor'")
@@ -176,7 +200,11 @@ class EditSession:
         self.cache = cache  # False: no prefix/encoder reuse (reference runs)
         self.mark_boxes = mark_boxes
         self.box_template = box_template or BOX_TEMPLATE
-        self.auto_prewarm = prewarm  # warm the next turn's prefix in the background after each edit
+        self.auto_prewarm = prewarm
+        # boxed edits generate only a crop around the boxes (+ context margin) when it is small enough
+        self.sigmas = sigmas  # explicit schedule, e.g. a Turbo subset for drafts
+        self.attention: str | None = None  # DiT-only attention override, e.g. "sage_attn"
+        self.crop, self.crop_margin_px, self.crop_min_px, self.crop_max_frac = crop, crop_margin_px, crop_min_px, crop_max_frac  # warm the next turn's prefix in the background after each edit
         self._io = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"mtedit-{session_id or 'io'}")
         self._saves: dict[str, Future] = {}
         self._warm: Future | None = None
@@ -249,6 +277,10 @@ class EditSession:
         mt = {"prefill_only": True, "prefix_cache": True}
         if self.passthrough:
             mt["ref_latents"] = {i: r.latent_id for i, r in enumerate(refs) if r.latent_id}
+            # references without stored latents (an uploaded root) get them now, for crop edits and passthrough
+            missing = {i: f"{self.id}/{r.id}" for i, r in enumerate(refs) if not r.latent_id}
+            if missing:
+                mt["store_ref_as"] = missing
 
         def run():
             self.engine.run(
@@ -256,6 +288,8 @@ class EditSession:
                 width=self.size[0], height=self.size[1], seed=0, mt=mt, name=f"session_{self.id}_warm",
                 steps=self.steps, guidance_scale=self.guidance_scale,
             )
+            for i, name in mt.get("store_ref_as", {}).items():  # only once the worker holds them
+                refs[i].latent_id = name
 
         if not background:
             return run()
@@ -282,6 +316,34 @@ class EditSession:
 
     # editing -----------------------------------------------------------------
 
+    def crop_rect(self, boxes: list[Box]) -> tuple[int, int, int, int] | None:
+        """Pixel window for a crop edit: the boxes' union plus margin, on the 16 px latent grid with
+        32 px-multiple sides; None when it would cover too much of the image to be worth it."""
+        W, H = self.size
+        ux0, uy0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
+        ux1, uy1 = max(b[2] for b in boxes), max(b[3] for b in boxes)
+        margin = max(self.crop_margin_px, 0.35 * max(ux1 - ux0, uy1 - uy0))
+
+        def span(lo, hi, limit):
+            lo, hi = max(0.0, lo - margin), min(float(limit), hi + margin)
+            need = min(max(self.crop_min_px, hi - lo), limit)
+            grow = need - (hi - lo)
+            lo, hi = lo - grow / 2, hi + grow / 2
+            if lo < 0:
+                lo, hi = 0, hi - lo
+            if hi > limit:
+                lo, hi = lo - (hi - limit), limit
+            lo = max(0, int(lo // 16) * 16)
+            size = min(-(-int(hi - lo) // 32) * 32, limit - limit % 32)
+            lo = min(lo, limit - size) // 16 * 16
+            return lo, lo + size
+
+        x0, x1 = span(ux0, ux1, W)
+        y0, y1 = span(uy0, uy1, H)
+        if (x1 - x0) * (y1 - y0) > self.crop_max_frac * W * H:
+            return None
+        return x0, y0, x1, y1
+
     def edit(
         self,
         instruction: str = "",
@@ -292,8 +354,15 @@ class EditSession:
         feather_px: float = 16.0,
         grow_px: float = 0.0,
         from_version: str | None = None,
+        raw_prompt: str | None = None,
+        sigmas: list[float] | None = None,
+        attention: str | None = None,
     ) -> Version:
-        """Apply one edit to ``from_version`` (default: head) and make the result the head."""
+        """Apply one edit to ``from_version`` (default: head) and make the result the head.
+
+        ``raw_prompt`` (e.g. from the prompt enhancer) is sent as is instead of the templated
+        instruction; boxes and regions still drive the marks and the mask.
+        """
         parent = self.versions[from_version or self.head]
         refs = self._refs(parent)
         canvas_ref = len(refs) - 1
@@ -311,12 +380,18 @@ class EditSession:
             task = self.box_template.format(instruction=instruction)
         else:
             task = instruction
+        if raw_prompt:
+            task = raw_prompt.strip()
         prompt = template.format(instruction=task)
 
         self._counter += 1
         vid = f"v{self._counter:03d}"
         latent_id = f"{self.id}/{vid}"
+        sigmas = sigmas if sigmas is not None else self.sigmas
+        attention = attention or self.attention
         mt: dict = {"store_output_as": latent_id, "prefix_cache": self.cache}
+        if sigmas:
+            mt["sigmas"] = list(sigmas)
         if self.passthrough:
             mt["ref_latents"] = {i: r.latent_id for i, r in enumerate(refs) if r.latent_id}
         if boxes:
@@ -327,24 +402,26 @@ class EditSession:
             if colors:
                 mt["mask"]["colors"] = [list(c) for c in colors]
         seed = int(time.time_ns() % (2**31)) if seed is None else seed
+        source = self._image_cache.get(parent.id) or Image.open(self.path(parent.id))
+        window = self.crop_rect(boxes) if boxes and self.crop else None
 
         start = time.perf_counter()
-        out, result = self.engine.run(
-            prompt=prompt,
-            images=[self._file(r.id) for r in refs],
-            width=self.size[0],
-            height=self.size[1],
-            seed=seed,
-            mt=mt,
-            name=f"session_{self.id}_{vid}_raw",
-            steps=self.steps,
-            guidance_scale=self.guidance_scale,
-        )
-        generated = time.perf_counter()
-        source = self._image_cache.get(parent.id) or Image.open(self.path(parent.id))
-        out = out.convert(source.mode)
-        if boxes and self.paste_back:
-            out = Image.composite(out, source, pixel_mask(out.size, boxes, feather_px, grow_px))
+        if window is None:
+            out, result = self.engine.run(
+                prompt=prompt, images=[self._file(r.id) for r in refs], width=self.size[0], height=self.size[1],
+                seed=seed, mt=mt, name=f"session_{self.id}_{vid}_raw", steps=self.steps,
+                guidance_scale=self.guidance_scale, attention=attention,
+            )
+            generated = time.perf_counter()
+            out = out.convert(source.mode)
+            if boxes and self.paste_back:
+                out = Image.composite(out, source, pixel_mask(out.size, boxes, feather_px, grow_px))
+        else:
+            out, result, latent_id = self._crop_edit(
+                parent, source, window, task, boxes, colors, regions, seed, feather_px, grow_px, vid, latent_id,
+                sigmas, attention,
+            )
+            generated = time.perf_counter()
         posted = time.perf_counter()
         path = os.path.join(self.dir, f"{vid}.png")
         self._image_cache[vid] = out
@@ -352,12 +429,12 @@ class EditSession:
         self._saves[vid] = self._io.submit(out.save, path, compress_level=1)
         seconds = time.perf_counter() - start
         timings = dict(generate=generated - start, post=posted - generated, save=time.perf_counter() - posted,
-                       server=getattr(result, "generation_time", 0.0))
+                       crop=list(window) if window else None)
 
         version = Version(
             id=vid, parent=parent.id, image_path=path, instruction=instruction, regions=regions,
             boxes=boxes, feather_px=feather_px, grow_px=grow_px, seed=seed,
-            latent_id=latent_id, seconds=seconds, timings=timings,
+            latent_id=latent_id, seconds=seconds, timings=timings, prompt=prompt,
         )
         self.versions[vid] = version
         parent.children.append(vid)
@@ -365,6 +442,41 @@ class EditSession:
         if self.auto_prewarm:
             self.prewarm(vid)
         return version
+
+    def _crop_edit(self, parent, source, window, task, boxes, colors, regions, seed, feather_px, grow_px, vid, latent_id,
+                   sigmas=None, attention=None):
+        """Generate only ``window`` and paste it back; returns (full image, result, latent id or None)."""
+        x0, y0, x1, y1 = window
+        cells = [x0 // 16, y0 // 16, x1 // 16, y1 // 16]
+        local = [(bx0 - x0, by0 - y0, bx1 - x0, by1 - y0) for bx0, by0, bx1, by1 in boxes]
+        crop_image = source.crop(window)
+        crop_path = os.path.join(self.dir, f"{vid}_in.png")
+        crop_image.save(crop_path, compress_level=1)
+        mt: dict = {
+            "prefix_cache": self.cache,
+            **({"sigmas": list(sigmas)} if sigmas else {}),
+            "mask": {"boxes": [list(b) for b in local], "canvas_ref": 0, "feather_px": feather_px,
+                     "grow_px": grow_px, "annotate": self.mark_boxes or bool(regions)},
+        }
+        if colors:
+            mt["mask"]["colors"] = [list(c) for c in colors]
+        if self.passthrough and parent.latent_id:
+            # clean source = a window of the parent's latents; the result is written back into a copy
+            mt["ref_latents"] = {0: parent.latent_id}
+            mt["ref_latent_crops"] = {0: cells}
+            mt["compose"] = {"base": parent.latent_id, "box": cells, "as": latent_id}
+        else:
+            latent_id = None  # no full latents to compose into; the next turn VAE-encodes this version
+        out, result = self.engine.run(
+            prompt=task, images=[crop_path], width=x1 - x0, height=y1 - y0, seed=seed, mt=mt,
+            name=f"session_{self.id}_{vid}_crop", steps=self.steps, guidance_scale=self.guidance_scale,
+            attention=attention,
+        )
+        out = out.convert(source.mode)
+        patch = Image.composite(out, crop_image, pixel_mask(out.size, local, feather_px, grow_px)) if self.paste_back else out
+        full = source.copy()
+        full.paste(patch, (x0, y0))
+        return full, result, latent_id
 
     def reroll(self, seed: int | None = None) -> Version:
         """Redo the head's edit from its parent with a new seed (its prefix K/V is fully cached)."""

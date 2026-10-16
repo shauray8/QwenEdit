@@ -44,7 +44,7 @@ def _profiled(fn, *args, **kwargs):
         out = fn(*args, **kwargs)
         torch.cuda.synchronize()
     logger.info("mtedit: profile of _predict_noise call %d\n%s", index,
-                prof.key_averages().table(sort_by="cuda_time_total", row_limit=15, max_name_column_width=70))
+                prof.key_averages().table(sort_by="cuda_time_total", row_limit=int(os.environ.get("MTEDIT_PROFILE_ROWS", 15)), max_name_column_width=90))
     return out
 
 
@@ -144,6 +144,16 @@ def _store_computed(model, caches: MTCaches, pending: list[int]) -> None:
         pool.insert(caches.vids[sample], slots, owned_from=0)
 
 
+# input validation: per-request sigma schedule -----------------------------------------
+
+
+def input_validation_around(original, self, batch, server_args):
+    mt = MTRequest.from_batch(batch)
+    if mt.sigmas:
+        batch.sigmas = list(mt.sigmas)  # upstream derives num_inference_steps from len(sigmas)
+    return original(self, batch, server_args)
+
+
 # _run_denoising_step: latent mask --------------------------------------------------
 
 
@@ -188,12 +198,34 @@ def run_denoising_step_around(original, self, ctx, step, batch, server_args):
 # post_denoising_loop: keep final latents for passthrough ------------------------------
 
 
+def _compose(spec, crop_latents, crop_grid) -> None:
+    """Write a crop edit's latents into a copy of the base's full latents; store under ``spec["as"]``."""
+    base = state.OUTPUT_LATENTS.get(spec.get("base"))
+    base_grid = state.OUTPUT_GRID.get(spec.get("base"))
+    if base is None or base_grid is None:
+        logger.warning("mtedit: compose base %s missing; the new version has no stored latents", spec.get("base"))
+        return
+    x0, y0, x1, y1 = (int(v) for v in spec["box"])
+    if (y1 - y0, x1 - x0) != crop_grid:
+        logger.warning("mtedit: compose box %s does not match the crop grid %s", spec["box"], crop_grid)
+        return
+    h, w = base_grid
+    full = base.view(1, h, w, -1).clone()
+    full[:, y0:y1, x0:x1] = crop_latents.detach().to(full.dtype).view(1, y1 - y0, x1 - x0, -1)
+    state.OUTPUT_LATENTS.put(spec["as"], full.view(1, h * w, -1))
+    state.OUTPUT_GRID[spec["as"]] = base_grid
+
+
 def post_denoising_loop_around(original, self, latents, batch):
     mt = MTRequest.from_batch(batch)
+    grid = (batch.height // 16, batch.width // 16)
     if mt.store_output_as:
         for index in range(latents.shape[0]):
             name = mt.store_output_as if index == 0 else f"{mt.store_output_as}#{index}"
             state.OUTPUT_LATENTS.put(name, latents[index : index + 1].detach().to(torch.bfloat16).clone())
+            state.OUTPUT_GRID[name] = grid
+    if mt.compose:
+        _compose(mt.compose, latents[:1], grid)
     batch.extra.pop(MASK_EXTRA_KEY, None)
     for branch in ("qwen21_positive", "qwen21_negative"):
         caches = (batch.extra.get(branch) or {}).get("prefix_caches")

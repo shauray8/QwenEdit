@@ -82,18 +82,31 @@ s.undo()
 s.edit("Replace the background with a snowy forest.")    # no box: a global edit
 ```
 
-Editing workspace (Gradio; `--share` gives a public link):
+Editor (custom web UI; `--share` exposes it through a Gradio share tunnel for pods with no open ports):
 
 ```
-CUDA_HOME=/usr/local/cuda-13.0 python -m mtedit.gradio_app --int8 --share
+CUDA_HOME=/usr/local/cuda-13.0 python -m mtedit.server --int8 --share \
+    [--enhancer-url http://127.0.0.1:30000]   # SGLang serving Qwen/Qwen-Image-2.1-PE-I2I
 ```
 
-Generate a base image or upload one, drag boxes on the canvas and label each
-with what should be there (colors are assigned automatically; each box is
-outlined in its own color for the model and named in the prompt), add an
-optional global instruction, apply. Re-roll, undo, and click any version to
-continue or branch from it. A plain JSON API (`python -m mtedit.server`) exposes
-the same session operations.
+Generate or drop an image, drag boxes on the canvas and type what goes in each
+(colors are assigned automatically), optionally add an overall instruction, press
+Enter. Quality / Fast / Draft picks 8 / 5 / 4 Turbo steps. ✨ Enhance rewrites the
+instruction with Qwen's official edit enhancer into an editable prompt. History on
+the right: click a version to continue or branch from it; R re-rolls, ⌘Z undoes,
+hold Space to compare with the previous version.
+
+## Speed (RTX PRO 6000, Turbo, INT8 ConvRot + fused LN/SwiGLU rotates, Sage2 DiT attention)
+
+| Edit | Time |
+|---|---|
+| Full frame, 8 steps | ~1.25 s |
+| Full frame, 5 steps (Fast) | ~0.9 s |
+| Small boxed edit, crop + Fast | ~0.4–0.75 s |
+| Re-roll | prefix fully cached |
+
+One DiT step of an edit is ~150 ms of CUDA time: INT8 GEMMs 52% (at the INT8 ceiling),
+attention 37% before Sage2 (the reference prefix doubles K/V), fused rotate/LN/residual ~7%.
 
 ## Environment
 
