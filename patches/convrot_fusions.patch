@@ -1,0 +1,1580 @@
+diff --git a/python/sglang/kernels/jit/csrc/gemm/convrot_int8/convrot_int8_entry.cuh b/python/sglang/kernels/jit/csrc/gemm/convrot_int8/convrot_int8_entry.cuh
+index 3c11ba2d7..812c75a6e 100644
+--- a/python/sglang/kernels/jit/csrc/gemm/convrot_int8/convrot_int8_entry.cuh
++++ b/python/sglang/kernels/jit/csrc/gemm/convrot_int8/convrot_int8_entry.cuh
+@@ -103,6 +103,25 @@ struct ATenGeluTanh {
+   }
+ };
+ 
++// SiLU matching ATen's CUDA kernel, x / (1 + exp(-x)) in fp32. Same reason as
++// above: libdevice expf and the _rn intrinsics are exempt from --use_fast_math,
++// which would otherwise swap in __expf and an approximate division.
++extern "C" __device__ float __nv_expf(float);
++
++struct ATenSilu {
++  SGL_DEVICE float operator()(float x) const {
++    return __fdiv_rn(x, __fadd_rn(1.0f, __nv_expf(-x)));
++  }
++};
++
++// Elementwise op the rotate kernel applies to x before the butterfly.
++enum class InputAct : int {
++  kNone = 0,
++  kGeluTanh = 1,
++  // silu(x) * up, for a SwiGLU down-projection whose gate and up are separate.
++  kSiluMul = 2,
++};
++
+ constexpr bool is_supported_group_size(int64_t group_size) {
+   return group_size == 64 || group_size == 128 || group_size == 256 || group_size == 512;
+ }
+@@ -217,12 +236,8 @@ SGL_DEVICE void rot_rotate_tile(float (&v)[kRotElemsPerLane], int q) {
+   }
+ }
+ 
+-// GeluInput fuses the F.gelu(approximate="tanh") that otherwise precedes an
+-// FFN down-projection. The GELU result is rounded to BF16 and back before the
+-// butterfly, so the rotated values are bitwise those of the eager
+-// store-then-reload path.
+-template <int GroupSize, bool GeluInput>
+-SGL_DEVICE void rot_load_tile(const __nv_bfloat16* __restrict__ grp, int q, bool active, float (&v)[kRotElemsPerLane]) {
++template <int GroupSize>
++SGL_DEVICE void rot_load_raw(const __nv_bfloat16* __restrict__ grp, int q, bool active, float (&v)[kRotElemsPerLane]) {
+   CUTLASS_PRAGMA_UNROLL
+   for (int j = 0; j < 4; j++) {
+     uint4 pk = make_uint4(0u, 0u, 0u, 0u);
+@@ -234,11 +249,33 @@ SGL_DEVICE void rot_load_tile(const __nv_bfloat16* __restrict__ grp, int q, bool
+       v[8 * j + 2 * e + 1] = __uint_as_float(w[e] & 0xffff0000u);
+     }
+   }
+-  if constexpr (GeluInput) {
++}
++
++// kGeluTanh fuses the F.gelu(approximate="tanh") that otherwise precedes an FFN
++// down-projection; kSiluMul fuses silu(x) * up for a SwiGLU one. Each eager op's
++// result is rounded to BF16 and back before the butterfly, so the rotated values
++// are bitwise those of the eager store-then-reload path.
++template <int GroupSize, InputAct Act>
++SGL_DEVICE void rot_load_tile(
++    const __nv_bfloat16* __restrict__ grp,
++    const __nv_bfloat16* __restrict__ grp_up,
++    int q,
++    bool active,
++    float (&v)[kRotElemsPerLane]) {
++  rot_load_raw<GroupSize>(grp, q, active, v);
++  if constexpr (Act == InputAct::kGeluTanh) {
+     CUTLASS_PRAGMA_UNROLL
+     for (int r = 0; r < kRotElemsPerLane; r++) {
+       v[r] = __bfloat162float(__float2bfloat16(ATenGeluTanh{}(v[r])));
+     }
++  } else if constexpr (Act == InputAct::kSiluMul) {
++    float up[kRotElemsPerLane];
++    rot_load_raw<GroupSize>(grp_up, q, active, up);
++    CUTLASS_PRAGMA_UNROLL
++    for (int r = 0; r < kRotElemsPerLane; r++) {
++      const float silu = __bfloat162float(__float2bfloat16(ATenSilu{}(v[r])));
++      v[r] = __bfloat162float(__float2bfloat16(__fmul_rn(silu, up[r])));
++    }
+   }
+ }
+ 
+@@ -277,9 +314,14 @@ SGL_DEVICE float rot_warp_max(float a) {
+ // the block, threadIdx.x >> 5 the tile within the row. Resident: warps_per_row ==
+ // n_tiles and the rotated row stays in registers across the barrier. Two-pass
+ // (!Resident, K > 32768): 32 warps stride over the tiles.
+-template <int GroupSize, bool GeluInput, int MaxThreads, bool Resident>
++template <int GroupSize, InputAct Act, int MaxThreads, bool Resident>
+ __global__ void __launch_bounds__(MaxThreads) convrot_rotate_quantize_activation_kernel(
+-    const __nv_bfloat16* __restrict__ x, int8_t* __restrict__ x_q, float* __restrict__ row_scale, int M, int K) {
++    const __nv_bfloat16* __restrict__ x,
++    const __nv_bfloat16* __restrict__ up,  // [M, K] for kSiluMul, else unused
++    int8_t* __restrict__ x_q,
++    float* __restrict__ row_scale,
++    int M,
++    int K) {
+   using Layout = RotLayout<GroupSize>;
+   __shared__ float warp_amax[kRotMaxWarps];
+ 
+@@ -295,6 +337,8 @@ __global__ void __launch_bounds__(MaxThreads) convrot_rotate_quantize_activation
+   const int num_groups = K / GroupSize;
+   const int n_tiles = (K + kRotTileElems - 1) / kRotTileElems;
+   const __nv_bfloat16* row_in = x + (int64_t)row * K;
++  // Only read for kSiluMul; the other ops alias row_in so no offset is applied to a null pointer.
++  const __nv_bfloat16* row_up = Act == InputAct::kSiluMul ? up + (int64_t)row * K : row_in;
+   int8_t* row_out = x_q + (int64_t)row * K;
+   // H / sqrt(GroupSize) on both operands keeps (Ux) . (Uw) == x . w exactly.
+   const float inv_sqrt_group = rsqrtf((float)GroupSize);
+@@ -304,7 +348,7 @@ __global__ void __launch_bounds__(MaxThreads) convrot_rotate_quantize_activation
+   const int g0 = tile0 * Layout::kGroupsPerTile + c;
+   const bool active0 = row_valid && (g0 < num_groups);
+   if constexpr (Resident) {
+-    rot_load_tile<GroupSize, GeluInput>(row_in + (int64_t)g0 * GroupSize, q, active0, v);
++    rot_load_tile<GroupSize, Act>(row_in + (int64_t)g0 * GroupSize, row_up + (int64_t)g0 * GroupSize, q, active0, v);
+     rot_rotate_tile<GroupSize>(v, q);
+     CUTLASS_PRAGMA_UNROLL
+     for (int r = 0; r < kRotElemsPerLane; r++) {
+@@ -316,7 +360,7 @@ __global__ void __launch_bounds__(MaxThreads) convrot_rotate_quantize_activation
+     for (int t = tile0; t < n_tiles; t += warps_per_row) {
+       const int g = t * Layout::kGroupsPerTile + c;
+       const bool active = row_valid && (g < num_groups);
+-      rot_load_tile<GroupSize, GeluInput>(row_in + (int64_t)g * GroupSize, q, active, v);
++      rot_load_tile<GroupSize, Act>(row_in + (int64_t)g * GroupSize, row_up + (int64_t)g * GroupSize, q, active, v);
+       rot_rotate_tile<GroupSize>(v, q);
+       CUTLASS_PRAGMA_UNROLL
+       for (int r = 0; r < kRotElemsPerLane; r++) {
+@@ -343,7 +387,7 @@ __global__ void __launch_bounds__(MaxThreads) convrot_rotate_quantize_activation
+     for (int t = tile0; t < n_tiles; t += warps_per_row) {
+       const int g = t * Layout::kGroupsPerTile + c;
+       const bool active = row_valid && (g < num_groups);
+-      rot_load_tile<GroupSize, GeluInput>(row_in + (int64_t)g * GroupSize, q, active, v);
++      rot_load_tile<GroupSize, Act>(row_in + (int64_t)g * GroupSize, row_up + (int64_t)g * GroupSize, q, active, v);
+       rot_rotate_tile<GroupSize>(v, q);
+       CUTLASS_PRAGMA_UNROLL
+       for (int r = 0; r < kRotElemsPerLane; r++)
+@@ -354,15 +398,16 @@ __global__ void __launch_bounds__(MaxThreads) convrot_rotate_quantize_activation
+ }
+ 
+ struct RotateOperands {
+-  const bf16_t* x;  // [M, K]
+-  int8_t* x_q;      // [M, K]
+-  float* x_scale;   // [M]
++  const bf16_t* x;   // [M, K]
++  const bf16_t* up;  // [M, K] for InputAct::kSiluMul, else nullptr
++  int8_t* x_q;       // [M, K]
++  float* x_scale;    // [M]
+   int32_t M;
+   int32_t K;
+   cudaStream_t stream;
+ };
+ 
+-template <int GroupSize, bool GeluInput>
++template <int GroupSize, InputAct Act>
+ void launch_rotate_quantize_kernel(const RotateOperands& op) {
+   const int n_tiles = (op.K + kRotTileElems - 1) / kRotTileElems;
+   if (n_tiles <= kRotMaxWarps) {
+@@ -371,16 +416,18 @@ void launch_rotate_quantize_kernel(const RotateOperands& op) {
+     const dim3 grid((op.M + rows_per_block - 1) / rows_per_block);
+     if (n_tiles <= kRotSmallTiles) {
+       LaunchKernel(grid, block, op.stream)(
+-          convrot_rotate_quantize_activation_kernel<GroupSize, GeluInput, 512, true>,
++          convrot_rotate_quantize_activation_kernel<GroupSize, Act, 512, true>,
+           op.x,
++          op.up,
+           op.x_q,
+           op.x_scale,
+           op.M,
+           op.K);
+     } else {
+       LaunchKernel(grid, block, op.stream)(
+-          convrot_rotate_quantize_activation_kernel<GroupSize, GeluInput, 1024, true>,
++          convrot_rotate_quantize_activation_kernel<GroupSize, Act, 1024, true>,
+           op.x,
++          op.up,
+           op.x_q,
+           op.x_scale,
+           op.M,
+@@ -388,8 +435,9 @@ void launch_rotate_quantize_kernel(const RotateOperands& op) {
+     }
+   } else {
+     LaunchKernel(dim3(op.M), dim3(32 * kRotMaxWarps, 1), op.stream)(
+-        convrot_rotate_quantize_activation_kernel<GroupSize, GeluInput, 1024, false>,
++        convrot_rotate_quantize_activation_kernel<GroupSize, Act, 1024, false>,
+         op.x,
++        op.up,
+         op.x_q,
+         op.x_scale,
+         op.M,
+@@ -398,11 +446,17 @@ void launch_rotate_quantize_kernel(const RotateOperands& op) {
+ }
+ 
+ template <int GroupSize>
+-void launch_rotate_quantize(const RotateOperands& op, bool gelu_input) {
+-  if (gelu_input) {
+-    launch_rotate_quantize_kernel<GroupSize, true>(op);
+-  } else {
+-    launch_rotate_quantize_kernel<GroupSize, false>(op);
++void launch_rotate_quantize(const RotateOperands& op, InputAct act) {
++  switch (act) {
++    case InputAct::kNone:
++      launch_rotate_quantize_kernel<GroupSize, InputAct::kNone>(op);
++      break;
++    case InputAct::kGeluTanh:
++      launch_rotate_quantize_kernel<GroupSize, InputAct::kGeluTanh>(op);
++      break;
++    case InputAct::kSiluMul:
++      launch_rotate_quantize_kernel<GroupSize, InputAct::kSiluMul>(op);
++      break;
+   }
+ }
+ 
+@@ -413,19 +467,300 @@ void check_group_size(int64_t K, int64_t group_size) {
+                                   << ")";
+ }
+ 
+-void rotate_quantize_rowwise(const RotateOperands& op, int64_t group_size, bool gelu_input) {
++void rotate_quantize_rowwise(const RotateOperands& op, int64_t group_size, InputAct act) {
+   switch (group_size) {
+     case 64:
+-      launch_rotate_quantize<64>(op, gelu_input);
++      launch_rotate_quantize<64>(op, act);
+       break;
+     case 128:
+-      launch_rotate_quantize<128>(op, gelu_input);
++      launch_rotate_quantize<128>(op, act);
+       break;
+     case 256:
+-      launch_rotate_quantize<256>(op, gelu_input);
++      launch_rotate_quantize<256>(op, act);
+       break;
+     case 512:
+-      launch_rotate_quantize<512>(op, gelu_input);
++      launch_rotate_quantize<512>(op, act);
++      break;
++    default:
++      Panic("convrot_int8: unreachable group_size ", group_size);
++  }
++}
++
++// ----------------------- LayerNorm + modulate + rotate -----------------------
++// y = bf16(LN(x) * bf16(1 + scale)) rotated and quantized without storing y, x
++// optionally formed as bf16(residual + bf16(update * gate)) on the way in. The
++// statistics replicate at::native::vectorized_layer_norm_kernel<BFloat16, float>
++// (see the numerics contract in kda_kernels/layernorm_modulate_triton.py): 128
++// threads per row, thread t Welford-pushes the 4-element vectors t, t + 128, ...,
++// shfl.down folds 16..1, then warps (0,2), (1,3), (0,1). The row is staged in
++// shared memory between that layout and the rotate layout. Explicit PTX keeps
++// --use_fast_math from flushing denormals or contracting the chain.
++constexpr int kLnThreads = 128;
++constexpr int kLnWarps = kLnThreads / 32;
++constexpr int kLnMaxK = kLnWarps * kRotTileElems;
++constexpr int kLnRowsPerBlock = 2;
++
++SGL_DEVICE float ln_add(float a, float b) {
++  float r;
++  asm("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
++  return r;
++}
++SGL_DEVICE float ln_sub(float a, float b) {
++  float r;
++  asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
++  return r;
++}
++SGL_DEVICE float ln_mul(float a, float b) {
++  float r;
++  asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
++  return r;
++}
++SGL_DEVICE float ln_fma(float a, float b, float c) {
++  float r;
++  asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
++  return r;
++}
++SGL_DEVICE float ln_div(float a, float b) {
++  float r;
++  asm("div.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
++  return r;
++}
++// nvcc's guarded-reciprocal fast path, which aten's 1 / count compiles to.
++SGL_DEVICE float ln_rcp(float x) {
++  float r;
++  asm("{\n\t.reg .f32 r0, e, e2;\n\t"
++      "rcp.approx.f32 r0, %1;\n\t"
++      "fma.rn.f32 e, %1, r0, 0fBF800000;\n\t"
++      "sub.ftz.f32 e2, 0f80000000, e;\n\t"
++      "fma.rn.f32 %0, r0, e2, r0;\n\t}"
++      : "=f"(r)
++      : "f"(x));
++  return r;
++}
++// rsqrtf as a non-ftz build emits it: MUFU.RSQ with a 2^24 / 2^12 rescale for subnormals.
++SGL_DEVICE float ln_rsqrt(float x) {
++  const bool subnormal = fabsf(x) < 1.17549435e-38f;
++  const float in = subnormal ? ln_mul(x, 16777216.f) : x;
++  float r;
++  asm("rsqrt.approx.f32 %0, %1;" : "=f"(r) : "f"(in));
++  return subnormal ? ln_mul(r, 4096.f) : r;
++}
++SGL_DEVICE float ln_round_bf16(float x) {
++  return __bfloat162float(__float2bfloat16_rn(x));
++}
++
++struct LnWelford {
++  float mean, m2, count;
++};
++
++SGL_DEVICE void ln_push(LnWelford& w, float val) {
++  const float delta = ln_sub(val, w.mean);
++  const float count = ln_add(w.count, 1.f);
++  const float mean = ln_fma(delta, ln_rcp(count), w.mean);
++  w.m2 = ln_fma(delta, ln_sub(val, mean), w.m2);
++  w.mean = mean;
++  w.count = count;
++}
++
++// cuWelfordCombine with b = self (lower lane / warp), a = other; the op order matters.
++SGL_DEVICE LnWelford ln_combine(const LnWelford& b, const LnWelford& a) {
++  const float count = ln_add(a.count, b.count);
++  if (!(count > 0.f)) return LnWelford{0.f, 0.f, count};
++  const float coef = ln_rcp(count);
++  const float delta = ln_sub(b.mean, a.mean);
++  const float n_b = ln_mul(coef, b.count);
++  const float n_a = ln_mul(a.count, coef);
++  const float mean = ln_fma(a.mean, n_a, ln_mul(n_b, b.mean));
++  const float m2 = ln_fma(n_b, ln_mul(a.count, ln_mul(delta, delta)), ln_add(a.m2, b.m2));
++  return LnWelford{mean, m2, count};
++}
++
++SGL_DEVICE void ln_unpack4(uint2 pk, float (&e)[4]) {
++  e[0] = __uint_as_float(pk.x << 16);
++  e[1] = __uint_as_float(pk.x & 0xffff0000u);
++  e[2] = __uint_as_float(pk.y << 16);
++  e[3] = __uint_as_float(pk.y & 0xffff0000u);
++}
++
++SGL_DEVICE uint2 ln_pack4(const float (&e)[4]) {
++  const __nv_bfloat162 lo = __floats2bfloat162_rn(e[0], e[1]);
++  const __nv_bfloat162 hi = __floats2bfloat162_rn(e[2], e[3]);
++  return make_uint2(*reinterpret_cast<const uint32_t*>(&lo), *reinterpret_cast<const uint32_t*>(&hi));
++}
++
++// Block = dim3(128, rows): one row per threadIdx.y, aten's 128 threads for the
++// statistics, then warp w rotates tile w (K <= 4096, so warps past the row idle).
++template <int GroupSize, bool Residual>
++__global__ void __launch_bounds__(kLnThreads* kLnRowsPerBlock) convrot_layernorm_modulate_rotate_quantize_kernel(
++    const __nv_bfloat16* __restrict__ x,       // [M, K]; the residual when Residual
++    const __nv_bfloat16* __restrict__ update,  // [M, K] when Residual
++    const __nv_bfloat16* __restrict__ gate,    // [B, K] rows of gate_row_stride when Residual
++    const __nv_bfloat16* __restrict__ scale,   // [B, K] rows of scale_row_stride
++    __nv_bfloat16* __restrict__ hidden,        // [M, K] output when Residual
++    int8_t* __restrict__ x_q,
++    float* __restrict__ row_scale,
++    int M,
++    int K,
++    int seq_len,
++    int64_t gate_row_stride,
++    int64_t scale_row_stride,
++    float eps) {
++  using Layout = RotLayout<GroupSize>;
++  __shared__ alignas(16) __nv_bfloat16 row_buf[kLnRowsPerBlock][kLnMaxK];
++  __shared__ LnWelford warp_stats[kLnRowsPerBlock][kLnWarps];
++  __shared__ float warp_amax[kLnRowsPerBlock][kLnWarps];
++
++  const int t = threadIdx.x;
++  const int lane = t & 31;
++  const int warp = t >> 5;
++  const int ry = threadIdx.y;
++  const int row = blockIdx.x * blockDim.y + ry;
++  const bool row_valid = row < M;  // padding rows compute on zeros and still reach the barriers
++  const int64_t batch = row_valid ? row / seq_len : 0;
++  const __nv_bfloat16* row_scale_in = scale + batch * scale_row_stride;
++
++  LnWelford w{0.f, 0.f, 0.f};
++  for (int vec = t; vec < K / 4; vec += kLnThreads) {
++    const int64_t off = (int64_t)row * K + 4 * vec;
++    float e[4];
++    ln_unpack4(row_valid ? *reinterpret_cast<const uint2*>(x + off) : make_uint2(0u, 0u), e);
++    if constexpr (Residual) {
++      float u[4], g[4];
++      ln_unpack4(row_valid ? *reinterpret_cast<const uint2*>(update + off) : make_uint2(0u, 0u), u);
++      ln_unpack4(*reinterpret_cast<const uint2*>(gate + batch * gate_row_stride + 4 * vec), g);
++      CUTLASS_PRAGMA_UNROLL
++      for (int i = 0; i < 4; i++) {
++        e[i] = ln_round_bf16(ln_add(e[i], ln_round_bf16(ln_mul(u[i], g[i]))));
++      }
++    }
++    const uint2 packed = ln_pack4(e);
++    *reinterpret_cast<uint2*>(&row_buf[ry][4 * vec]) = packed;
++    if constexpr (Residual) {
++      if (row_valid) *reinterpret_cast<uint2*>(hidden + off) = packed;
++    }
++    CUTLASS_PRAGMA_UNROLL
++    for (int i = 0; i < 4; i++) {
++      ln_push(w, e[i]);
++    }
++  }
++  CUTLASS_PRAGMA_UNROLL
++  for (int off = 16; off > 0; off >>= 1) {
++    const LnWelford other{
++        __shfl_down_sync(kRotFullMask, w.mean, off),
++        __shfl_down_sync(kRotFullMask, w.m2, off),
++        __shfl_down_sync(kRotFullMask, w.count, off)};
++    w = ln_combine(w, other);
++  }
++  if (lane == 0) warp_stats[ry][warp] = w;
++  __syncthreads();
++
++  const LnWelford s = ln_combine(
++      ln_combine(warp_stats[ry][0], warp_stats[ry][2]), ln_combine(warp_stats[ry][1], warp_stats[ry][3]));
++  const float mean = s.mean;
++  const float rstd = ln_rsqrt(ln_add(ln_div(s.m2, (float)K), eps));
++
++  const int c = lane / Layout::kLanesPerGroup;
++  const int q = lane % Layout::kLanesPerGroup;
++  const int g0 = warp * Layout::kGroupsPerTile + c;
++  const bool active = g0 < K / GroupSize;
++  const float inv_sqrt_group = rsqrtf((float)GroupSize);
++  float v[kRotElemsPerLane];
++  CUTLASS_PRAGMA_UNROLL
++  for (int j = 0; j < 4; j++) {
++    const int col = g0 * GroupSize + Layout::run_offset(q, j);
++    uint4 xs = make_uint4(0u, 0u, 0u, 0u), sc = make_uint4(0u, 0u, 0u, 0u);
++    if (active) {
++      xs = *reinterpret_cast<const uint4*>(&row_buf[ry][col]);
++      sc = *reinterpret_cast<const uint4*>(row_scale_in + col);
++    }
++    const uint32_t xw[4] = {xs.x, xs.y, xs.z, xs.w};
++    const uint32_t sw[4] = {sc.x, sc.y, sc.z, sc.w};
++    CUTLASS_PRAGMA_UNROLL
++    for (int e = 0; e < 8; e++) {
++      const float xv = __uint_as_float(e & 1 ? xw[e >> 1] & 0xffff0000u : xw[e >> 1] << 16);
++      const float sv = __uint_as_float(e & 1 ? sw[e >> 1] & 0xffff0000u : sw[e >> 1] << 16);
++      const float y = ln_round_bf16(ln_mul(rstd, ln_sub(xv, mean)));
++      v[8 * j + e] = active ? ln_round_bf16(ln_mul(y, ln_round_bf16(ln_add(1.f, sv)))) : 0.f;
++    }
++  }
++  rot_rotate_tile<GroupSize>(v, q);
++  float local_amax = 0.f;
++  CUTLASS_PRAGMA_UNROLL
++  for (int r = 0; r < kRotElemsPerLane; r++) {
++    v[r] *= inv_sqrt_group;
++    local_amax = fmaxf(local_amax, fabsf(v[r]));
++  }
++  local_amax = rot_warp_max(local_amax);
++  if (lane == 0) warp_amax[ry][warp] = local_amax;
++  __syncthreads();
++
++  // Same scale expressions as convrot_rotate_quantize_activation_kernel.
++  const float amax = rot_warp_max(lane < kLnWarps ? warp_amax[ry][lane] : 0.f);
++  const float scale_q = (amax > 0.f) ? (amax / 127.f) : 1.f;
++  const float inv_scale = 1.f / scale_q;
++  if (row_valid && t == 0) row_scale[row] = scale_q;
++  rot_quant_store_tile<GroupSize>(x_q + (int64_t)row * K + (int64_t)g0 * GroupSize, q, active && row_valid, v, inv_scale);
++}
++
++struct LayerNormRotateOperands {
++  const bf16_t* x;
++  const bf16_t* update;  // nullptr without the residual
++  const bf16_t* gate;
++  const bf16_t* scale;
++  bf16_t* hidden;
++  int8_t* x_q;
++  float* x_scale;
++  int32_t M;
++  int32_t K;
++  int32_t seq_len;
++  int64_t gate_row_stride;
++  int64_t scale_row_stride;
++  float eps;
++  cudaStream_t stream;
++};
++
++template <int GroupSize, bool Residual>
++void launch_layernorm_rotate_kernel(const LayerNormRotateOperands& op) {
++  const int rows = std::min(op.M, kLnRowsPerBlock);
++  LaunchKernel(dim3((op.M + rows - 1) / rows), dim3(kLnThreads, rows), op.stream)(
++      convrot_layernorm_modulate_rotate_quantize_kernel<GroupSize, Residual>,
++      op.x,
++      op.update,
++      op.gate,
++      op.scale,
++      op.hidden,
++      op.x_q,
++      op.x_scale,
++      op.M,
++      op.K,
++      op.seq_len,
++      op.gate_row_stride,
++      op.scale_row_stride,
++      op.eps);
++}
++
++template <int GroupSize>
++void launch_layernorm_rotate(const LayerNormRotateOperands& op) {
++  if (op.update != nullptr) {
++    launch_layernorm_rotate_kernel<GroupSize, true>(op);
++  } else {
++    launch_layernorm_rotate_kernel<GroupSize, false>(op);
++  }
++}
++
++void layernorm_rotate_quantize_rowwise(const LayerNormRotateOperands& op, int64_t group_size) {
++  switch (group_size) {
++    case 64:
++      launch_layernorm_rotate<64>(op);
++      break;
++    case 128:
++      launch_layernorm_rotate<128>(op);
++      break;
++    case 256:
++      launch_layernorm_rotate<256>(op);
++      break;
++    case 512:
++      launch_layernorm_rotate<512>(op);
+       break;
+     default:
+       Panic("convrot_int8: unreachable group_size ", group_size);
+@@ -855,8 +1190,97 @@ ElementOutput* bias_ptr_or_null(const tvm::ffi::Optional<TensorView>& bias) {
+   return bias.has_value() ? static_cast<ElementOutput*>(bias.value().data_ptr()) : nullptr;
+ }
+ 
++// A [B, K] modulation row: packed last dim, any row stride (chunks of one adaLN
++// projection), 16-byte aligned rows for the vector loads.
++int64_t verify_modulation_rows(TensorView view, const char* name, int64_t B, int64_t K, SymbolicDevice& device) {
++  SymbolicSize stride{"row_stride"};
++  TensorMatcher({B, K}).with_strides({stride, 1}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(view);
++  const int64_t row_stride = B > 1 ? stride.unwrap() : K;
++  CHECK_HOST((reinterpret_cast<uintptr_t>(view.data_ptr()) & 15) == 0 && row_stride % 8 == 0)
++      << "convrot_int8: " << name << " rows must be 16-byte aligned";
++  return row_stride;
++}
++
+ }  // namespace convrot_int8
+ 
++/**
++ * \brief LayerNorm (no affine) + adaLN scale, then the ConvRot rotation and INT8 quantization.
++ *
++ * x_q / x_scale are bitwise convrot_rotate_quantize_activation(y, group_size) with
++ * y = LN(h) * (1 + scale[b]) evaluated as torch's BF16 chain (one rounding per op)
++ * and b = row / seq_len. Without update, h = x; with update, h = x + update * gate[b]
++ * (again one BF16 rounding per op) and h is written to hidden. y itself is never stored.
++ *
++ * \param x_q int8 [M, K] output, contiguous.
++ * \param x_scale float32 [M] output.
++ * \param hidden BF16 [M, K] output; required with update, ignored otherwise.
++ * \param x BF16 [M, K], contiguous; the residual stream when update is given.
++ * \param scale BF16 [M / seq_len, K] adaLN scale rows; may be a strided view.
++ * \param update Optional BF16 [M, K] contiguous branch output.
++ * \param gate BF16 [M / seq_len, K] gate rows; required with update.
++ * \param seq_len Rows per batch entry.
++ * \param eps LayerNorm epsilon.
++ * \param group_size Hadamard group width; K must be a multiple of it and at most 4096.
++ */
++void convrot_layernorm_modulate_rotate_quantize(
++    tvm::ffi::TensorView x_q,
++    tvm::ffi::TensorView x_scale,
++    tvm::ffi::Optional<tvm::ffi::TensorView> hidden,
++    tvm::ffi::TensorView x,
++    tvm::ffi::TensorView scale,
++    tvm::ffi::Optional<tvm::ffi::TensorView> update,
++    tvm::ffi::Optional<tvm::ffi::TensorView> gate,
++    int64_t seq_len,
++    float eps,
++    int64_t group_size) {
++  using namespace convrot_int8;
++  SymbolicSize M{"M"}, K{"K"};
++  SymbolicDevice device;
++  device.set_options<kDLCUDA>();
++  verify_activation<bf16_t>(x, "x", M, K, device, group_size);
++  verify_activation<int8_t>(x_q, "x_q", M, K, device, group_size);
++  TensorMatcher({M}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(x_scale);
++  const int64_t m = M.unwrap(), k = K.unwrap();
++  CHECK_HOST(k <= kLnMaxK) << "convrot_int8: the LayerNorm rotate takes K <= " << kLnMaxK << ", got " << k;
++  CHECK_HOST(seq_len > 0 && m % seq_len == 0) << "convrot_int8: M (" << m << ") must be a multiple of seq_len";
++  const int64_t batch = m / seq_len;
++  const int64_t scale_row_stride = verify_modulation_rows(scale, "scale", batch, k, device);
++  const bf16_t* update_ptr = nullptr;
++  const bf16_t* gate_ptr = nullptr;
++  bf16_t* hidden_ptr = nullptr;
++  int64_t gate_row_stride = 0;
++  if (update.has_value()) {
++    CHECK_HOST(gate.has_value() && hidden.has_value()) << "convrot_int8: update needs gate and hidden";
++    verify_activation<bf16_t>(update.value(), "update", M, K, device, group_size);
++    verify_activation<bf16_t>(hidden.value(), "hidden", M, K, device, group_size);
++    gate_row_stride = verify_modulation_rows(gate.value(), "gate", batch, k, device);
++    update_ptr = static_cast<const bf16_t*>(update.value().data_ptr());
++    gate_ptr = static_cast<const bf16_t*>(gate.value().data_ptr());
++    hidden_ptr = static_cast<bf16_t*>(hidden.value().data_ptr());
++  }
++  if (m == 0) return;
++  const DLDevice dev = device.unwrap();
++  const tvm::ffi::CUDADeviceGuard guard(dev.device_id);
++  layernorm_rotate_quantize_rowwise(
++      LayerNormRotateOperands{
++          .x = static_cast<const bf16_t*>(x.data_ptr()),
++          .update = update_ptr,
++          .gate = gate_ptr,
++          .scale = static_cast<const bf16_t*>(scale.data_ptr()),
++          .hidden = hidden_ptr,
++          .x_q = static_cast<int8_t*>(x_q.data_ptr()),
++          .x_scale = static_cast<float*>(x_scale.data_ptr()),
++          .M = checked_int32(m, "M"),
++          .K = checked_int32(k, "K"),
++          .seq_len = checked_int32(seq_len, "seq_len"),
++          .gate_row_stride = gate_row_stride,
++          .scale_row_stride = scale_row_stride,
++          .eps = eps,
++          .stream = LaunchKernel::resolve_device(dev),
++      },
++      group_size);
++}
++
+ /**
+  * \brief Group-wise Hadamard rotation followed by per-row dynamic INT8 quantization.
+  *
+@@ -888,6 +1312,7 @@ void convrot_rotate_quantize_activation(
+   rotate_quantize_rowwise(
+       RotateOperands{
+           .x = static_cast<const bf16_t*>(x.data_ptr()),
++          .up = nullptr,
+           .x_q = static_cast<int8_t*>(x_q.data_ptr()),
+           .x_scale = static_cast<float*>(x_scale.data_ptr()),
+           .M = checked_int32(M.unwrap(), "M"),
+@@ -895,7 +1320,7 @@ void convrot_rotate_quantize_activation(
+           .stream = LaunchKernel::resolve_device(dev),
+       },
+       group_size,
+-      /*gelu_input=*/false);
++      InputAct::kNone);
+ }
+ 
+ /**
+@@ -906,7 +1331,10 @@ void convrot_rotate_quantize_activation(
+  * convrot_rotate_quantize_activation(x, group_size). With gelu_input, x is
+  * passed through GELU(tanh) inside the rotate kernel first, using ATen's fp32
+  * formula rounded to BF16, so the result is bitwise that of the eager
+- * F.gelu(x, approximate="tanh") followed by this op.
++ * F.gelu(x, approximate="tanh") followed by this op. With silu_mul_up, x is the
++ * gate and the rotate kernel first forms F.silu(x) * silu_mul_up, rounding each
++ * of the two eager ops to BF16, so the result is bitwise that of the eager
++ * SwiGLU followed by this op.
+  *
+  * \param out BF16 [M, N] output, contiguous.
+  * \param x BF16 [M, K], contiguous; K must be a multiple of group_size.
+@@ -915,6 +1343,8 @@ void convrot_rotate_quantize_activation(
+  * \param bias Optional BF16 [N].
+  * \param group_size Hadamard group width shared by both operands.
+  * \param gelu_input Apply GELU(tanh) to x before the rotation.
++ * \param silu_mul_up Optional BF16 [M, K] up projection; applies silu(x) * up before
++ *        the rotation. Exclusive with gelu_input.
+  */
+ void convrot_int8_fused_linear(
+     tvm::ffi::TensorView out,
+@@ -923,7 +1353,8 @@ void convrot_int8_fused_linear(
+     tvm::ffi::TensorView weight_scale,
+     tvm::ffi::Optional<tvm::ffi::TensorView> bias,
+     int64_t group_size,
+-    bool gelu_input) {
++    bool gelu_input,
++    tvm::ffi::Optional<tvm::ffi::TensorView> silu_mul_up) {
+   using namespace convrot_int8;
+   SymbolicSize M{"M"}, K{"K"}, N{"N"};
+   SymbolicDevice device;
+@@ -931,7 +1362,14 @@ void convrot_int8_fused_linear(
+   verify_activation<bf16_t>(x, "x", M, K, device, group_size);
+   verify_weight(weight_q, weight_scale, bias, N, K, device);
+   TensorMatcher({M, N}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).ensure_alignment(16).verify(out);
++  const bf16_t* up = nullptr;
++  if (silu_mul_up.has_value()) {
++    CHECK_HOST(!gelu_input) << "convrot_int8: gelu_input and silu_mul_up are exclusive";
++    verify_activation<bf16_t>(silu_mul_up.value(), "silu_mul_up", M, K, device, group_size);
++    up = static_cast<const bf16_t*>(silu_mul_up.value().data_ptr());
++  }
+   if (M.unwrap() == 0) return;
++  const InputAct act = up != nullptr ? InputAct::kSiluMul : (gelu_input ? InputAct::kGeluTanh : InputAct::kNone);
+ 
+   const DLDevice dev = device.unwrap();
+   const tvm::ffi::CUDADeviceGuard guard(dev.device_id);
+@@ -942,6 +1380,7 @@ void convrot_int8_fused_linear(
+   rotate_quantize_rowwise(
+       RotateOperands{
+           .x = static_cast<const bf16_t*>(x.data_ptr()),
++          .up = up,
+           .x_q = static_cast<int8_t*>(x_q.data_ptr()),
+           .x_scale = static_cast<float*>(x_scale.data_ptr()),
+           .M = checked_int32(m, "M"),
+@@ -949,7 +1388,7 @@ void convrot_int8_fused_linear(
+           .stream = stream,
+       },
+       group_size,
+-      gelu_input);
++      act);
+   dispatch_convrot_int8_gemm(
+       GemmOperands{
+           .out = static_cast<ElementOutput*>(out.data_ptr()),
+diff --git a/python/sglang/kernels/kda_kernels/layernorm_modulate_triton.py b/python/sglang/kernels/kda_kernels/layernorm_modulate_triton.py
+index cc18c6026..7a9edfe49 100644
+--- a/python/sglang/kernels/kda_kernels/layernorm_modulate_triton.py
++++ b/python/sglang/kernels/kda_kernels/layernorm_modulate_triton.py
+@@ -7,6 +7,8 @@ launch while reproducing the eager results bit for bit (``torch.equal``),
+ so callers need no quality gate:
+ 
+ - ``fused_layernorm_modulate``: ``LN(x) * (1 + scale) + shift``
++- ``fused_residual_gate_layernorm_modulate``: ``h = res + upd * gate`` and
++  ``LN(h) * (1 + scale)``, returning both
+ - ``fused_qk_head_layernorm``: per-head ``LN(q)`` / ``LN(k)``
+ 
+ Numerics contract (replicates torch 2.11's
+@@ -305,6 +307,93 @@ def _layernorm_modulate_kernel(
+             )
+ 
+ 
++@triton.jit(do_not_specialize=["seq_len", "n_rows"])
++def _residual_gate_layernorm_modulate_kernel(
++    hidden_ptr,
++    y_ptr,
++    residual_ptr,
++    update_ptr,
++    gate_ptr,
++    scale_ptr,
++    seq_len,
++    n_rows,
++    gate_row_stride,
++    scale_row_stride,
++    eps,
++    D: tl.constexpr,
++    ROWS: tl.constexpr,
++):
++    # hidden = residual + update * gate, then y = LN(hidden) * (1 + scale);
++    # the statistics and the modulate chain are those of _layernorm_modulate_kernel
++    # with HAS_SHIFT=False, so y is bitwise fused_layernorm_modulate(hidden, scale).
++    pid = tl.program_id(0).to(tl.int64)
++    row_offs = pid * ROWS + tl.arange(0, ROWS)
++    row_mask = row_offs < n_rows
++    row_base = row_offs * D
++    batch = row_offs // seq_len
++
++    lanes = tl.arange(0, 128)
++    mean = tl.zeros((ROWS, 128), dtype=tl.float32)
++    m2 = tl.zeros((ROWS, 128), dtype=tl.float32)
++    cnt = tl.zeros((ROWS, 128), dtype=tl.float32)
++
++    # pass 1: form hidden in aten's per-op rounding (mul, then add), store it,
++    # and Welford-push it in aten's LayerNorm element order.
++    for i in tl.static_range((D + 511) // 512):
++        cols = i * 512 + lanes[:, None] * 4 + tl.arange(0, 4)[None, :]
++        vec_valid = (i * 128 + lanes < D // 4)[None, :]
++        mask = row_mask[:, None, None]
++        if (i + 1) * 512 > D:
++            mask = mask & vec_valid[:, :, None]
++        offs = row_base[:, None, None] + cols[None, :, :]
++        res = tl.load(residual_ptr + offs, mask=mask, other=0.0).to(tl.float32)
++        upd = tl.load(update_ptr + offs, mask=mask, other=0.0).to(tl.float32)
++        gate = tl.load(
++            gate_ptr + batch[:, None, None] * gate_row_stride + cols[None, :, :],
++            mask=mask,
++            other=0.0,
++        ).to(tl.float32)
++        x4 = round_bf16_to_fp32(res + round_bf16_to_fp32(upd * gate))
++        tl.store(hidden_ptr + offs, x4, mask=mask)
++        if (i + 1) * 512 <= D:
++            mean, m2, cnt = _push_vec4(
++                x4, mean, m2, cnt, row_mask, ROWS, 128, MASKED=False
++            )
++        else:
++            mean, m2, cnt = _push_vec4(
++                x4, mean, m2, cnt, vec_valid, ROWS, 128, MASKED=True
++            )
++
++    mean = tl.reshape(mean, (ROWS * 4, 32), can_reorder=False)
++    m2 = tl.reshape(m2, (ROWS * 4, 32), can_reorder=False)
++    cnt = tl.reshape(cnt, (ROWS * 4, 32), can_reorder=False)
++    mean, m2, cnt = _fold_tree_32(mean, m2, cnt, ROWS * 4)
++    mean = tl.reshape(mean, (ROWS, 4), can_reorder=False)
++    m2 = tl.reshape(m2, (ROWS, 4), can_reorder=False)
++    cnt = tl.reshape(cnt, (ROWS, 4), can_reorder=False)
++    mean, m2, cnt = _fold_halves(mean, m2, cnt, ROWS, 2)
++    mean, m2, cnt = _fold_halves(mean, m2, cnt, ROWS, 1)
++    denom = tl.zeros((ROWS, 1), dtype=tl.float32) + D
++    rstd = cuda_rsqrtf(div_rn_f32(m2, denom) + eps)
++
++    # pass 2 re-reads hidden in a different thread layout than pass 1 wrote it.
++    tl.debug_barrier()
++    for i in tl.static_range((D + 511) // 512):
++        cols = i * 512 + tl.arange(0, 512)
++        mask = row_mask[:, None]
++        if (i + 1) * 512 > D:
++            mask = mask & (cols < D)[None, :]
++        x = tl.load(hidden_ptr + row_base[:, None] + cols[None, :], mask=mask, other=0.0).to(tl.float32)
++        y = round_bf16_to_fp32(rstd * (x - mean))
++        sc = tl.load(
++            scale_ptr + batch[:, None] * scale_row_stride + cols[None, :],
++            mask=mask,
++            other=0.0,
++        ).to(tl.float32)
++        y = round_bf16_to_fp32(y * round_bf16_to_fp32(1.0 + sc))
++        tl.store(y_ptr + row_base[:, None] + cols[None, :], y, mask=mask)
++
++
+ @triton.jit
+ def _qk_ln_head_one(
+     dst,
+@@ -605,6 +694,74 @@ fused_layernorm_modulate = register_custom_op(
+ )
+ 
+ 
++def fused_residual_gate_layernorm_modulate_raw(
++    residual: torch.Tensor,
++    update: torch.Tensor,
++    gate: torch.Tensor,
++    scale: torch.Tensor,
++    eps: float,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """``h = residual + update * gate.unsqueeze(1)`` and ``LN(h) * (1 + scale.unsqueeze(1))``
++    in one launch, both bit-exact vs the eager aten chain (LayerNorm without affine).
++
++    Returns ``(h, y)``. ``gate`` and ``scale`` are BF16 [B, D] rows, each possibly a
++    strided view; ``residual`` and ``update`` are contiguous BF16 [B, S, D].
++    """
++    batch, seq_len, hidden, stride = _validate_layernorm_modulate(residual, scale, None)
++    if not (
++        _is_bf16_cuda(update)
++        and update.shape == residual.shape
++        and update.is_contiguous()
++        and update.device == residual.device
++        and gate.dtype is torch.bfloat16
++        and gate.device == residual.device
++        and (gate_stride := _mod_row_stride(gate, batch, hidden)) is not None
++    ):
++        raise RuntimeError(
++            "update must match residual, and gate must be BF16 [B, D] with a packed last dim"
++        )
++    n_rows = batch * seq_len
++    rows = 2
++    out_hidden = torch.empty_like(residual)
++    out = torch.empty_like(residual)
++    with torch.cuda.device(residual.device):
++        _residual_gate_layernorm_modulate_kernel[(triton.cdiv(n_rows, rows),)](
++            out_hidden,
++            out,
++            residual,
++            update,
++            gate,
++            scale,
++            seq_len,
++            n_rows,
++            gate_stride,
++            stride,
++            eps,
++            D=hidden,
++            ROWS=rows,
++            num_warps=4 if hidden >= 2048 else 2,
++        )
++    return out_hidden, out
++
++
++def _fake_residual_gate_ln_modulate(
++    residual: torch.Tensor,
++    update: torch.Tensor,
++    gate: torch.Tensor,
++    scale: torch.Tensor,
++    eps: float,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    return torch.empty_like(residual), torch.empty_like(residual)
++
++
++fused_residual_gate_layernorm_modulate = register_custom_op(
++    fused_residual_gate_layernorm_modulate_raw,
++    op_name="triton_fused_residual_gate_layernorm_modulate",
++    mutates_args=[],
++    fake_impl=_fake_residual_gate_ln_modulate,
++)
++
++
+ def can_use_fused_qk_head_layernorm(dtype: torch.dtype, head_dim: int) -> bool:
+     """Select the BF16 per-head LayerNorm reduction."""
+     return (
+diff --git a/python/sglang/kernels/ops/diffusion/__init__.py b/python/sglang/kernels/ops/diffusion/__init__.py
+index 27fa0211f..76cb13d4a 100644
+--- a/python/sglang/kernels/ops/diffusion/__init__.py
++++ b/python/sglang/kernels/ops/diffusion/__init__.py
+@@ -182,6 +182,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
+         _CUDA,
+         "Bit-exact LayerNorm + adaLN modulate.",
+     ),
++    (
++        "diffusion.residual_gate_layernorm_modulate",
++        KernelBackend.TRITON,
++        "sglang.kernels.kda_kernels.layernorm_modulate_triton:fused_residual_gate_layernorm_modulate",
++        _CUDA,
++        "Bit-exact gated residual add + LayerNorm + scale-only adaLN modulate.",
++    ),
+     (
+         "diffusion.qk_head_layernorm",
+         KernelBackend.TRITON,
+@@ -638,6 +645,7 @@ _EXPORTS: dict[str, str] = {
+     "fused_layernorm_modulate_fp8_quant_raw": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
+     "fused_layernorm_modulate_raw": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
+     "fused_qk_head_layernorm": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
++    "fused_residual_gate_layernorm_modulate": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
+     "is_plain_layer_norm": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
+     "rmsnorm_scale": "norm.native_bf16_rmsnorm_triton",
+     "rmsnorm_tanh_residual": "norm.native_bf16_rmsnorm_triton",
+diff --git a/python/sglang/kernels/ops/gemm/convrot_int8.py b/python/sglang/kernels/ops/gemm/convrot_int8.py
+index 0d1d2b151..f23ed237d 100644
+--- a/python/sglang/kernels/ops/gemm/convrot_int8.py
++++ b/python/sglang/kernels/ops/gemm/convrot_int8.py
+@@ -89,6 +89,10 @@ def _jit_convrot_int8_module() -> Module:
+             ),
+             ("convrot_int8_fused_linear", "convrot_int8_fused_linear"),
+             ("convrot_int8_linear_prequant", "convrot_int8_linear_prequant"),
++            (
++                "convrot_layernorm_modulate_rotate_quantize",
++                "convrot_layernorm_modulate_rotate_quantize",
++            ),
+         ],
+         extra_dependencies=["cutlass"],
+         extra_cuda_cflags=_convrot_int8_cuda_flags(),
+@@ -128,10 +132,11 @@ def _convrot_int8_fused_linear_op(
+     bias: torch.Tensor | None,
+     group_size: int,
+     gelu_input: bool,
++    silu_mul_up: torch.Tensor | None,
+ ) -> None:
+     module = _jit_convrot_int8_module()
+     module.convrot_int8_fused_linear(
+-        out, x, weight_q, weight_scale, bias, group_size, gelu_input
++        out, x, weight_q, weight_scale, bias, group_size, gelu_input, silu_mul_up
+     )
+ 
+ 
+@@ -151,6 +156,28 @@ def _convrot_int8_linear_prequant_op(
+     )
+ 
+ 
++@register_custom_op(
++    op_name="convrot_layernorm_modulate_rotate_quantize",
++    mutates_args=["x_q", "x_scale", "hidden"],
++)
++def _convrot_layernorm_modulate_rotate_quantize_op(
++    x_q: torch.Tensor,
++    x_scale: torch.Tensor,
++    hidden: torch.Tensor | None,
++    x: torch.Tensor,
++    scale: torch.Tensor,
++    update: torch.Tensor | None,
++    gate: torch.Tensor | None,
++    seq_len: int,
++    eps: float,
++    group_size: int,
++) -> None:
++    module = _jit_convrot_int8_module()
++    module.convrot_layernorm_modulate_rotate_quantize(
++        x_q, x_scale, hidden, x, scale, update, gate, seq_len, eps, group_size
++    )
++
++
+ @debug_kernel_api
+ def convrot_rotate_quantize_activation(
+     x: torch.Tensor, group_size: int
+@@ -181,12 +208,16 @@ def convrot_int8_fused_linear(
+     *,
+     out: torch.Tensor | None = None,
+     gelu_input: bool = False,
++    silu_mul_up: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """BF16 [M, K] x int8 [N, K] -> BF16 [M, N]; x is rotated and quantized in-kernel.
+ 
+     ``out`` must be a contiguous BF16 [M, N] when given (a row slice of a larger
+     buffer qualifies). ``gelu_input`` applies GELU(tanh) to x inside the rotate
+     kernel, bitwise equal to the eager ``F.gelu(x, approximate="tanh")`` first.
++    ``silu_mul_up`` (contiguous BF16 [M, K]) treats x as a SwiGLU gate and applies
++    ``F.silu(x) * silu_mul_up`` inside the rotate kernel, bitwise equal to the
++    eager pair; exclusive with ``gelu_input``.
+     """
+     if out is None:
+         out = torch.empty(
+@@ -194,11 +225,11 @@ def convrot_int8_fused_linear(
+         )
+     if torch.compiler.is_compiling():
+         _convrot_int8_fused_linear_op(
+-            out, x, weight_q, weight_scale, bias, group_size, gelu_input
++            out, x, weight_q, weight_scale, bias, group_size, gelu_input, silu_mul_up
+         )
+     else:
+         _jit_convrot_int8_module().convrot_int8_fused_linear(
+-            out, x, weight_q, weight_scale, bias, group_size, gelu_input
++            out, x, weight_q, weight_scale, bias, group_size, gelu_input, silu_mul_up
+         )
+     return out
+ 
+@@ -229,3 +260,42 @@ def convrot_int8_linear_prequant(
+             out, xq, xs, weight_q, weight_scale, bias, group_size
+         )
+     return out
++
++
++# Widest row the LayerNorm rotate holds: aten's 128 LayerNorm threads, 1024 elements per warp.
++LAYERNORM_ROTATE_MAX_K = 4096
++
++
++@debug_kernel_api
++def convrot_layernorm_modulate_rotate_quantize(
++    x: torch.Tensor,
++    scale: torch.Tensor,
++    eps: float,
++    group_size: int,
++    *,
++    update: torch.Tensor | None = None,
++    gate: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
++    """``convrot_rotate_quantize_activation(LN(h) * (1 + scale))`` without storing the LN output.
++
++    ``x`` is a contiguous BF16 [B, S, K] with K <= 4096; ``scale`` and ``gate`` are
++    BF16 [B, K] rows (strided views allowed, 16-byte aligned). ``h`` is ``x``, or
++    ``x + update * gate[:, None]`` when ``update`` is given. Each op rounds to BF16
++    as the eager torch chain does, so the result is bitwise that of
++    ``nn.LayerNorm(K, eps, elementwise_affine=False)`` followed by the modulate and
++    ``convrot_rotate_quantize_activation``. Returns (x_q int8 [B*S, K], x_scale
++    float32 [B*S], h [B, S, K] when ``update`` is given, else None).
++    """
++    batch, seq_len, hidden_size = x.shape
++    rows = x.reshape(-1, hidden_size)
++    x_q = torch.empty(rows.shape, dtype=torch.int8, device=x.device)
++    x_scale = torch.empty(rows.shape[0], dtype=torch.float32, device=x.device)
++    hidden = None if update is None else torch.empty_like(x)
++    upd = None if update is None else update.reshape(-1, hidden_size)
++    hid = None if hidden is None else hidden.view(-1, hidden_size)
++    args = (x_q, x_scale, hid, rows, scale, upd, gate, seq_len, eps, group_size)
++    if torch.compiler.is_compiling():
++        _convrot_layernorm_modulate_rotate_quantize_op(*args)
++    else:
++        _jit_convrot_int8_module().convrot_layernorm_modulate_rotate_quantize(*args)
++    return x_q, x_scale, hidden
+diff --git a/python/sglang/multimodal_gen/runtime/layers/quantization/convrot_int8_jit.py b/python/sglang/multimodal_gen/runtime/layers/quantization/convrot_int8_jit.py
+index 5831c3884..703abfe5f 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/quantization/convrot_int8_jit.py
++++ b/python/sglang/multimodal_gen/runtime/layers/quantization/convrot_int8_jit.py
+@@ -13,10 +13,11 @@ the local GPU on first use (nvcc, about a minute once per machine; cached
+ afterwards). A missing toolchain or a failed build makes this backend
+ unavailable, and ``auto`` then takes comfy_kitchen.
+ 
+-Two variants of that op are exposed to the model code as helpers below: a
++Three variants of that op are exposed to the model code as helpers below: a
+ shared-input form that rotates and quantizes an activation once for several
+-linears consuming it (a q/k/v trio), and a gelu-input form that applies
+-GELU(tanh) inside the rotate kernel for an FFN down-projection. Both are
++linears consuming it (a q/k/v trio), a gelu-input form that applies GELU(tanh)
++inside the rotate kernel for an FFN down-projection, and a silu-mul-input form
++that applies silu(gate) * up there for a SwiGLU down-projection. All are
+ bitwise identical to the plain op on the equivalent eager input.
+ """
+ 
+@@ -30,10 +31,12 @@ import torch
+ from torch.nn.parameter import Parameter
+ 
+ from sglang.kernels.ops.gemm.convrot_int8 import (
++    LAYERNORM_ROTATE_MAX_K,
+     convrot_int8_fused_linear,
+     convrot_int8_linear_prequant,
+     convrot_int8_local_capability,
+     convrot_int8_supported_capabilities,
++    convrot_layernorm_modulate_rotate_quantize,
+     convrot_rotate_quantize_activation,
+     load_convrot_int8_module,
+ )
+@@ -58,9 +61,14 @@ __all__ = [
+     "ConvRotInt8JitLinearMethod",
+     "REFUSED_CAPABILITY_REASONS",
+     "apply_convrot_int8_gelu_input",
++    "apply_convrot_int8_prequant",
+     "apply_convrot_int8_shared_input",
+     "apply_convrot_int8_shared_input_out",
++    "apply_convrot_int8_silu_mul_input",
+     "convrot_int8_fuses_gelu_input",
++    "convrot_int8_fuses_layernorm_modulate_input",
++    "convrot_int8_fuses_silu_mul_input",
++    "quantize_convrot_int8_layernorm_modulate_input",
+     "convrot_int8_shares_input",
+     "jit_convrot_available",
+     "jit_convrot_unavailable_reason",
+@@ -315,18 +323,62 @@ def apply_convrot_int8_shared_input(
+     """
+     group_size = layers[0].quant_method.group_size
+     x_q, x_scale = convrot_rotate_quantize_activation(_as_rows(x), group_size)
+-    outs = []
+-    for layer in layers:
+-        out = convrot_int8_linear_prequant(
+-            x_q,
+-            x_scale,
+-            layer.weight,
+-            layer.weight_scale,
+-            layer.bias,
+-            group_size,
++    return apply_convrot_int8_prequant(x_q, x_scale, layers, like=x)
++
++
++def apply_convrot_int8_prequant(
++    x_q: torch.Tensor,
++    x_scale: torch.Tensor,
++    layers: Sequence[LinearBase],
++    *,
++    like: torch.Tensor,
++) -> list[torch.Tensor]:
++    """``[layer(x)[0] for layer in layers]`` for the ``x`` that ``(x_q, x_scale)``
++    quantize; ``like`` has ``x``'s leading shape and dtype. ``layers`` must pass
++    ``convrot_int8_shares_input``."""
++    group_size = layers[0].quant_method.group_size
++    return [
++        _like_input(
++            out=convrot_int8_linear_prequant(
++                x_q, x_scale, layer.weight, layer.weight_scale, layer.bias, group_size
++            ),
++            x=like,
+         )
+-        outs.append(_like_input(out=out, x=x))
+-    return outs
++        for layer in layers
++    ]
++
++
++def convrot_int8_fuses_layernorm_modulate_input(
++    layers: Sequence[torch.nn.Module], hidden_size: int
++) -> bool:
++    """Whether ``quantize_convrot_int8_layernorm_modulate_input`` feeds ``layers``
++    through ``apply_convrot_int8_prequant`` for rows of ``hidden_size``."""
++    return convrot_int8_shares_input(layers) and hidden_size <= LAYERNORM_ROTATE_MAX_K
++
++
++def quantize_convrot_int8_layernorm_modulate_input(
++    x: torch.Tensor,
++    scale: torch.Tensor,
++    eps: float,
++    layers: Sequence[LinearBase],
++    *,
++    update: torch.Tensor | None = None,
++    gate: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
++    """Rotated and quantized ``LN(h) * (1 + scale)`` for ``layers``, without storing it.
++
++    ``h`` is ``x``, or ``x + update * gate`` (returned as the third element) when
++    ``update`` is given; see ``convrot_layernorm_modulate_rotate_quantize`` in
++    ``sglang.kernels.ops.gemm.convrot_int8`` for the layouts and the numerics.
++    """
++    return convrot_layernorm_modulate_rotate_quantize(
++        x,
++        scale,
++        eps,
++        layers[0].quant_method.group_size,
++        update=update,
++        gate=gate,
++    )
+ 
+ 
+ def apply_convrot_int8_shared_input_out(
+@@ -380,3 +432,26 @@ def apply_convrot_int8_gelu_input(layer: LinearBase, x: torch.Tensor) -> torch.T
+         gelu_input=True,
+     )
+     return _like_input(out=out, x=x)
++
++
++def convrot_int8_fuses_silu_mul_input(layer: torch.nn.Module) -> bool:
++    """Whether ``apply_convrot_int8_silu_mul_input`` reproduces
++    ``layer(F.silu(gate) * up)[0]``."""
++    return _is_jit_int8(layer) and _forward_is_plain_apply(layer)
++
++
++def apply_convrot_int8_silu_mul_input(
++    layer: LinearBase, gate: torch.Tensor, up: torch.Tensor
++) -> torch.Tensor:
++    """``layer(F.silu(gate) * up)[0]`` as one op, bitwise identical to the eager
++    pair followed by the layer for BF16 ``gate`` and ``up`` of the same shape;
++    see ``convrot_int8_fused_linear`` in ``sglang.kernels.ops.gemm.convrot_int8``."""
++    out = convrot_int8_fused_linear(
++        _as_rows(gate),
++        layer.weight,
++        layer.weight_scale,
++        layer.bias,
++        layer.quant_method.group_size,
++        silu_mul_up=_as_rows(up),
++    )
++    return _like_input(out=out, x=gate)
+diff --git a/python/sglang/multimodal_gen/runtime/models/dits/qwen_image21.py b/python/sglang/multimodal_gen/runtime/models/dits/qwen_image21.py
+index a8f62de63..0831ff6d4 100644
+--- a/python/sglang/multimodal_gen/runtime/models/dits/qwen_image21.py
++++ b/python/sglang/multimodal_gen/runtime/models/dits/qwen_image21.py
+@@ -12,6 +12,7 @@ from sglang.kernels.ops.diffusion import (
+     can_use_qknorm_complex_rope_cuda,
+     fused_complex_rope,
+     fused_layernorm_modulate,
++    fused_residual_gate_layernorm_modulate,
+     fused_silu_mul_bitexact,
+     qknorm_complex_rope_cuda,
+     qknorm_complex_rope_pack_,
+@@ -19,6 +20,7 @@ from sglang.kernels.ops.diffusion import (
+     rmsnorm_preserve_reduction,
+     tensors_equal,
+ )
++from sglang.kernels.ops.gemm.convrot_int8 import convrot_rotate_quantize_activation
+ from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
+     qknorm_complex_rope_kv,
+ )
+@@ -45,6 +47,15 @@ from sglang.multimodal_gen.runtime.layers.linear import (
+     UnquantizedLinearMethod,
+ )
+ from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
++from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
++    apply_convrot_int8_prequant,
++    apply_convrot_int8_shared_input,
++    apply_convrot_int8_silu_mul_input,
++    convrot_int8_fuses_layernorm_modulate_input,
++    convrot_int8_fuses_silu_mul_input,
++    convrot_int8_shares_input,
++    quantize_convrot_int8_layernorm_modulate_input,
++)
+ from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+     LayerwiseOffloadableModuleMixin,
+@@ -81,6 +92,12 @@ _QKV_PACK_FUSION = BitExactFusionGate(
+ )
+ _QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
+ _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
++_RESIDUAL_MODULATION_FUSION = BitExactFusionGate(
++    "Qwen-Image 2.1 gated residual + LayerNorm modulation"
++)
++_LAYERNORM_ROTATE_FUSION = BitExactFusionGate(
++    "Qwen-Image 2.1 LayerNorm modulation fused into the ConvRot INT8 rotate"
++)
+ 
+ 
+ def build_layout(image_slots, image_shapes, axes_dims, device):
+@@ -271,6 +288,92 @@ def apply_modulation(x, norm, scale):
+     return out
+ 
+ 
++def _pairs_equal(a, b):
++    return all(torch.equal(x, y) for x, y in zip(a, b, strict=True))
++
++
++def residual_gate_then_modulate(residual, update, gate, norm, scale):
++    """``(h, apply_modulation(h, norm, scale))`` with ``h = residual + update * gate``."""
++    fused = None
++    if (
++        residual.is_cuda
++        and residual.dim() == 3
++        and update.shape == residual.shape
++        and residual.is_contiguous()
++        and update.is_contiguous()
++        and can_use_fused_layernorm_modulate(residual.dtype, residual.shape[-1])
++        and _RESIDUAL_MODULATION_FUSION.can_attempt_once()
++    ):
++        fused = fused_residual_gate_layernorm_modulate(
++            residual, update, gate.squeeze(1), scale.squeeze(1), norm.eps
++        )
++        if _RESIDUAL_MODULATION_FUSION.verified:
++            return fused
++    hidden = residual_gate_add(residual, update, gate)
++    out = (hidden, apply_modulation(hidden, norm, scale))
++    if fused is not None:
++        return _RESIDUAL_MODULATION_FUSION.accept_or_fallback(
++            fused, out, equal=_pairs_equal, logger=logger
++        )
++    return out
++
++
++def project_shared(layers, x):
++    """``[layer(x)[0] for layer in layers]``, rotating and quantizing ``x`` once for ConvRot INT8."""
++    if convrot_int8_shares_input(layers):
++        return apply_convrot_int8_shared_input(x, layers)
++    return [layer(x)[0] for layer in layers]
++
++
++def _modulation_rows_aligned(rows):
++    # The fused rotate reads [B, D] modulation rows with 16-byte vector loads.
++    return rows.data_ptr() % 16 == 0 and (rows.shape[0] == 1 or rows.stride(0) % 8 == 0)
++
++
++def layernorm_modulate_quantized(layers, x, norm, scale, update=None, gate=None):
++    """``(x_q, x_scale, h)`` quantizing ``apply_modulation(h, norm, scale)`` for ``layers``.
++
++    ``h`` is ``x``, or ``residual_gate_add(x, update, gate)`` when ``update`` is
++    given (then also returned; None otherwise). None when the ConvRot INT8 path
++    does not apply, in which case the caller runs the unfused chain.
++    """
++    scale = scale.squeeze(1)
++    gate = None if gate is None else gate.squeeze(1)
++    if not (
++        _is_cuda
++        and x.is_cuda
++        and x.dtype is torch.bfloat16
++        and x.dim() == 3
++        and x.is_contiguous()
++        and (update is None or (update.shape == x.shape and update.is_contiguous()))
++        and convrot_int8_fuses_layernorm_modulate_input(layers, x.shape[-1])
++        and _modulation_rows_aligned(scale)
++        and (gate is None or _modulation_rows_aligned(gate))
++        and _LAYERNORM_ROTATE_FUSION.can_attempt_once()
++    ):
++        return None
++    fused = quantize_convrot_int8_layernorm_modulate_input(
++        x, scale, norm.eps, layers, update=update, gate=gate
++    )
++    if _LAYERNORM_ROTATE_FUSION.verified:
++        return fused
++    hidden = x if update is None else residual_gate_add(x, update, gate[:, None])
++    y = norm(hidden) * (1 + scale[:, None])
++    reference = (
++        *convrot_rotate_quantize_activation(
++            y.reshape(-1, y.shape[-1]), layers[0].quant_method.group_size
++        ),
++        None if update is None else hidden,
++    )
++    return _LAYERNORM_ROTATE_FUSION.accept_or_fallback(
++        fused,
++        reference,
++        equal=lambda a, b: _pairs_equal(a[:2], b[:2])
++        and (a[2] is None or torch.equal(a[2], b[2])),
++        logger=logger,
++    )
++
++
+ class QwenImage21ZeroCenterRMSNorm(nn.Module):
+     def __init__(self, dim, eps):
+         super().__init__()
+@@ -344,7 +447,20 @@ class QwenImage21FeedForward(nn.Module):
+         )
+ 
+     def forward(self, x):
+-        gate, value = self.gate_layer(x)[0], self.proj(x)[0]
++        return self._down(*project_shared((self.gate_layer, self.proj), x))
++
++    def forward_prequant(self, x_q, x_scale, like):
++        """``forward(x)`` for the ``x`` that ``(x_q, x_scale)`` quantize; ``like`` is shaped as ``x``."""
++        gate, value = apply_convrot_int8_prequant(
++            x_q, x_scale, (self.gate_layer, self.proj), like=like
++        )
++        return self._down(gate, value)
++
++    def _down(self, gate, value):
++        # Bitwise equal to the SwiGLU below for BF16; saves writing and re-reading
++        # the [tokens, ffn_dim] activation between the two kernels.
++        if gate.dtype is torch.bfloat16 and convrot_int8_fuses_silu_mul_input(self.out):
++            return apply_convrot_int8_silu_mul_input(layer=self.out, gate=gate, up=value)
+         fused = None
+         if (
+             _is_cuda
+@@ -483,11 +599,15 @@ class QwenImage21Attention(nn.Module):
+         self.pack_qkv_weights()
+         return module
+ 
++    @property
++    def qkv_layers(self):
++        return (self.to_q, self.to_k, self.to_v)
++
+     def project_qkv(self, x):
+-        q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
+-        k = self.to_k(x)[0].unflatten(-1, (self.heads, self.head_dim))
+-        v = self.to_v(x)[0].unflatten(-1, (self.heads, self.head_dim))
+-        return q, k, v
++        return self.split_heads(project_shared(self.qkv_layers, x))
++
++    def split_heads(self, outs):
++        return tuple(out.unflatten(-1, (self.heads, self.head_dim)) for out in outs)
+ 
+     def qkv(self, x, rope):
+         q, k, v = self.project_qkv(x)
+@@ -709,10 +829,14 @@ class QwenImage21Attention(nn.Module):
+                 )
+         return out, prefix_output
+ 
+-    def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad):
++    def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad, qkv=None):
++        """``qkv`` holds the target Q/K/V already projected from ``x`` (then None)."""
+         # batch target projections while retaining each sample's unpadded prefix
+-        packed = self._project_qkv_packed(x, layouts, caches)
+-        if packed is not None:
++        packed = None if qkv is not None else self._project_qkv_packed(x, layouts, caches)
++        if qkv is not None:
++            q, k, v = qkv
++            k_out = v_out = None
++        elif packed is not None:
+             q, k, v, k_out, v_out = packed
+         else:
+             buffers = self._project_kv_into_buffers(x, layouts, caches)
+@@ -779,20 +903,38 @@ class QwenImage21TransformerBlock(nn.Module):
+             else None
+             for state, cache in zip(prefix_states, caches, strict=True)
+         ]
++        attn_input, qkv = None, None
++        quantized = layernorm_modulate_quantized(
++            self.attn.qkv_layers, hidden_states, self.img_norm1, scale1
++        )
++        if quantized is None:
++            attn_input = apply_modulation(hidden_states, self.img_norm1, scale1)
++        else:
++            qkv = self.attn.split_heads(
++                apply_convrot_int8_prequant(
++                    *quantized[:2], self.attn.qkv_layers, like=hidden_states
++                )
++            )
+         attention, prefix_attentions = self.attn(
+-            apply_modulation(hidden_states, self.img_norm1, scale1),
+-            ropes,
+-            prefixes,
+-            layouts,
+-            caches,
+-            prefix_pad,
+-        )
+-        hidden_states = residual_gate_add(hidden_states, attention, gate1)
+-        hidden_states = residual_gate_add(
++            attn_input, ropes, prefixes, layouts, caches, prefix_pad, qkv=qkv
++        )
++        quantized = layernorm_modulate_quantized(
++            (self.img_mlp.gate_layer, self.img_mlp.proj),
+             hidden_states,
+-            self.img_mlp(apply_modulation(hidden_states, self.img_norm2, scale2)),
+-            gate2,
++            self.img_norm2,
++            scale2,
++            update=attention,
++            gate=gate1,
+         )
++        if quantized is None:
++            hidden_states, mlp_input = residual_gate_then_modulate(
++                hidden_states, attention, gate1, self.img_norm2, scale2
++            )
++            mlp_output = self.img_mlp(mlp_input)
++        else:
++            x_q, x_scale, hidden_states = quantized
++            mlp_output = self.img_mlp.forward_prequant(x_q, x_scale, like=hidden_states)
++        hidden_states = residual_gate_add(hidden_states, mlp_output, gate2)
+         for state, attention in zip(prefix_states, prefix_attentions, strict=True):
+             if attention is not None:
+                 _, pg1, ps2, pg2 = prefix_modulation
+diff --git a/test/registered/kernels/ops/diffusion/test_layernorm_modulate.py b/test/registered/kernels/ops/diffusion/test_layernorm_modulate.py
+index f8de64574..f28a61ef7 100644
+--- a/test/registered/kernels/ops/diffusion/test_layernorm_modulate.py
++++ b/test/registered/kernels/ops/diffusion/test_layernorm_modulate.py
+@@ -7,6 +7,7 @@ from torch.nn import functional as F
+ 
+ from sglang.kernels.ops.diffusion import (
+     fused_layernorm_modulate,
++    fused_residual_gate_layernorm_modulate,
+ )
+ from sglang.test.ci.ci_register import register_cuda_ci
+ 
+@@ -39,6 +40,26 @@ def test_modulation_preserves_bits(shape, amplitude, eps, has_shift):
+     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+ 
+ 
++# (1, 9, 1000) leaves a partial last 512-wide chunk, the masked tail of the reduction.
++@pytest.mark.parametrize("shape", [(1, 4359, 4096), (2, 1024, 4096), (1, 9, 1000)])
++@pytest.mark.parametrize("amplitude", [1e-2, 1.0, 100.0])
++# Packed is the DiT's case: tanh() copies the gate out of the chunked adaLN rows
++# while scale stays a strided view, so the two row strides differ when B > 1.
++@pytest.mark.parametrize("packed_gate", [True, False])
++def test_residual_gate_modulation_preserves_bits(shape, amplitude, packed_gate):
++    torch.manual_seed(7)
++    residual = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * amplitude
++    update = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
++    modulation = torch.randn(shape[0], 4 * shape[-1], device="cuda", dtype=residual.dtype)
++    scale, gate = modulation.chunk(4, dim=-1)[:2]
++    gate = gate.tanh() if packed_gate else gate.tanh_()
++    hidden, out = fused_residual_gate_layernorm_modulate(residual, update, gate, scale, 1e-6)
++    expected_hidden = residual + update * gate[:, None]
++    expected = reference(expected_hidden, scale, None, 1e-6)
++    assert torch.equal(hidden.view(torch.int16), expected_hidden.view(torch.int16))
++    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
++
++
+ def test_scale_only_preserves_signed_zero():
+     x = torch.ones(1, 17, 128, device="cuda", dtype=torch.bfloat16)
+     scale = torch.full((1, 128), -2, device=x.device, dtype=x.dtype)
+diff --git a/test/registered/kernels/ops/gemm/test_convrot_int8.py b/test/registered/kernels/ops/gemm/test_convrot_int8.py
+index 6959cc59f..f6c276ebd 100644
+--- a/test/registered/kernels/ops/gemm/test_convrot_int8.py
++++ b/test/registered/kernels/ops/gemm/test_convrot_int8.py
+@@ -11,6 +11,7 @@ from sglang.kernels.ops.gemm.convrot_int8 import (
+     convrot_int8_fused_linear,
+     convrot_int8_linear_prequant,
+     convrot_int8_supported_capabilities,
++    convrot_layernorm_modulate_rotate_quantize,
+     convrot_rotate_quantize_activation,
+ )
+ from sglang.test.ci.ci_register import register_cuda_ci
+@@ -253,6 +254,96 @@ def test_gelu_input_bitwise_equals_eager_gelu(M):
+     assert torch.equal(fused, ref)
+ 
+ 
++@pytest.mark.parametrize("M", PRODUCTION_M)
++def test_silu_mul_input_bitwise_equals_eager_swiglu(M):
++    # Qwen-Image 2.1 SwiGLU down-projection: K = ffn width, N = hidden.
++    K, N = 12288, 4096
++    gate, _, weight_q, weight_scale, bias = _make_inputs(M, K, N, with_bias=True)
++    gen = torch.Generator(device="cuda").manual_seed(1)
++    up = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, generator=gen)
++    fused = convrot_int8_fused_linear(
++        gate, weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE, silu_mul_up=up
++    )
++    ref = convrot_int8_fused_linear(
++        F.silu(gate) * up, weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE
++    )
++    assert torch.equal(fused, ref)
++
++
++def test_silu_mul_input_rejects_gelu_input():
++    gate, _, weight_q, weight_scale, bias = _make_inputs(20, 3072, 3072, with_bias=True)
++    with pytest.raises(RuntimeError, match="exclusive"):
++        convrot_int8_fused_linear(
++            gate,
++            weight_q,
++            weight_scale,
++            bias=bias,
++            group_size=GROUP_SIZE,
++            gelu_input=True,
++            silu_mul_up=gate,
++        )
++
++
++def _layernorm_modulate_inputs(B, S, K, amplitude, packed_gate):
++    gen = torch.Generator(device="cuda").manual_seed(3)
++    x = torch.randn(B, S, K, device="cuda", generator=gen) * amplitude
++    x = (x + amplitude * torch.randn(K, device="cuda", generator=gen)).bfloat16()
++    update = torch.randn(B, S, K, device="cuda", generator=gen).bfloat16()
++    # scale and gate as the DiT chunks them from one adaLN projection; tanh()
++    # copies the gate out of it, tanh_() keeps it a strided view.
++    modulation = torch.randn(B, 4 * K, device="cuda", generator=gen).bfloat16()
++    scale, gate = modulation.chunk(4, dim=-1)[:2]
++    gate = gate.tanh() if packed_gate else gate.tanh_()
++    return x, update, scale, gate
++
++
++# K = 3328 leaves the LayerNorm threads a partial last pass (832 vectors over 128
++# threads); a K that does so is never a multiple of 512.
++@pytest.mark.parametrize(
++    "B,S,K,group_size",
++    [(1, 4096, 4096, g) for g in (64, 256, 512)]
++    + [(2, 333, 4096, 256), (1, 77, 3328, 64), (1, 77, 3328, 256)],
++)
++@pytest.mark.parametrize("amplitude", [1e-2, 1.0, 100.0])
++@pytest.mark.parametrize("residual", [False, True])
++def test_layernorm_modulate_rotate_bitwise_equals_eager(B, S, K, group_size, amplitude, residual):
++    x, update, scale, gate = _layernorm_modulate_inputs(
++        B, S, K, amplitude, packed_gate=residual
++    )
++    eps = 1e-6
++    h = x + update * gate[:, None] if residual else x
++    y = F.layer_norm(h, (K,), eps=eps) * (1 + scale[:, None])
++    ref_q, ref_scale = convrot_rotate_quantize_activation(y.reshape(-1, K), group_size)
++    x_q, x_scale, hidden = convrot_layernorm_modulate_rotate_quantize(
++        x,
++        scale,
++        eps,
++        group_size,
++        update=update if residual else None,
++        gate=gate if residual else None,
++    )
++    assert torch.equal(x_q, ref_q)
++    assert torch.equal(x_scale, ref_scale)
++    if residual:
++        assert torch.equal(hidden.view(torch.int16), h.view(torch.int16))
++    else:
++        assert hidden is None
++
++
++def test_layernorm_modulate_rotate_strided_gate_and_rejects_wide_rows():
++    x, update, scale, gate = _layernorm_modulate_inputs(2, 64, 4096, 1.0, packed_gate=False)
++    h = x + update * gate[:, None]
++    y = F.layer_norm(h, (4096,), eps=1e-6) * (1 + scale[:, None])
++    ref_q, _ = convrot_rotate_quantize_activation(y.reshape(-1, 4096), GROUP_SIZE)
++    x_q, _, _ = convrot_layernorm_modulate_rotate_quantize(
++        x, scale, 1e-6, GROUP_SIZE, update=update, gate=gate
++    )
++    assert torch.equal(x_q, ref_q)
++    wide = torch.zeros(1, 2, 4352, device="cuda", dtype=torch.bfloat16)
++    with pytest.raises(RuntimeError, match="K <= 4096"):
++        convrot_layernorm_modulate_rotate_quantize(wide, wide[:, 0], 1e-6, GROUP_SIZE)
++
++
+ def test_empty_batch():
+     x, _, weight_q, weight_scale, bias = _make_inputs(0, 3072, 3072, with_bias=True)
+     out = convrot_int8_fused_linear(
