@@ -12,6 +12,7 @@ own color and the prompt names it ("inside the blue box: ...").
 from __future__ import annotations
 
 import argparse
+import os
 import threading
 import uuid
 
@@ -208,6 +209,8 @@ def main():
 
     extra = {"component_quantizations": {"transformer": "convrot_int8"}} if args.int8 else {}
     _engine = Engine(args.model, out_dir=args.out, **extra)
+    # Gradio's file checks call os.getcwd(); run from the output folder so code syncs can't remove it
+    os.chdir(_engine.out_dir)
     try:
         build().queue(default_concurrency_limit=1).launch(
             server_name="0.0.0.0", server_port=args.port, share=args.share, show_error=True,
