@@ -43,9 +43,12 @@ class MaskState:
     editable: torch.Tensor  # [1, HW, 1]
     eps: torch.Tensor | None = None
 
-    def blend(self, latents: torch.Tensor, sigma: float) -> torch.Tensor:
+    def blend(self, latents: torch.Tensor, sigma) -> torch.Tensor:
+        """``sigma`` is a float or a 0-d tensor (kept on device to avoid a host sync)."""
         x0 = self.x0.to(device=latents.device, dtype=latents.dtype)
         eps = self.eps.to(device=latents.device, dtype=latents.dtype)
         m = self.editable.to(device=latents.device, dtype=latents.dtype)
+        if isinstance(sigma, torch.Tensor):
+            sigma = sigma.to(device=latents.device, dtype=latents.dtype)
         keep = (1 - sigma) * x0 + sigma * eps
         return m * latents + (1 - m) * keep

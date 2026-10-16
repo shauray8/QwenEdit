@@ -17,7 +17,43 @@ logger = logging.getLogger(__name__)
 # _predict_noise: prefix K/V from the store ---------------------------------------
 
 
+_calls = 0
+
+
+def _profiled(fn, *args, **kwargs):
+    """MTEDIT_PROFILE_CALLS=12,20 logs the top CUDA kernels of those _predict_noise calls."""
+    global _calls
+    import os
+
+    index, _calls = _calls, _calls + 1
+    wanted = {int(c) for c in os.environ.get("MTEDIT_PROFILE_CALLS", "").split(",") if c}
+    if os.environ.get("MTEDIT_TIME") == "1":
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        out = fn(*args, **kwargs)
+        end.record()
+        end.synchronize()
+        logger.info("mtedit: call %d gpu %.1f ms", index, start.elapsed_time(end))
+        return out
+    if index not in wanted:
+        return fn(*args, **kwargs)
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        out = fn(*args, **kwargs)
+        torch.cuda.synchronize()
+    logger.info("mtedit: profile of _predict_noise call %d\n%s", index,
+                prof.key_averages().table(sort_by="cuda_time_total", row_limit=15, max_name_column_width=70))
+    return out
+
+
 def predict_noise_around(original, self, current_model, latent_model_input, timestep, target_dtype, guidance, **kwargs):
+    return _profiled(_predict_noise_impl, original, self, current_model, latent_model_input, timestep,
+                     target_dtype, guidance, **kwargs)
+
+
+def _predict_noise_impl(original, self, current_model, latent_model_input, timestep, target_dtype, guidance, **kwargs):
     caches = kwargs.get("prefix_caches")
     if not isinstance(caches, MTCaches) or caches.prepared:
         return original(self, current_model, latent_model_input, timestep, target_dtype, guidance, **kwargs)
@@ -99,9 +135,16 @@ def _insert_into_store(caches: MTCaches) -> None:
 # _run_denoising_step: latent mask --------------------------------------------------
 
 
-def _next_sigma(scheduler, step_index: int) -> float:
+def _next_sigma(scheduler, step_index: int):
+    """Sigma of the sample the scheduler just produced (its step index already advanced).
+
+    Returned as a 0-d tensor on the sigmas' device: ``float()`` on a GPU sigma
+    would sync the host every step and stall the launch queue.
+    """
     sigmas = scheduler.sigmas
-    return float(sigmas[step_index + 1]) if step_index + 1 < len(sigmas) else 0.0
+    index = getattr(scheduler, "step_index", None)
+    index = step_index + 1 if index is None else index
+    return sigmas[index] if index < len(sigmas) else sigmas.new_zeros(())
 
 
 def run_denoising_step_around(original, self, ctx, step, batch, server_args):
@@ -110,8 +153,21 @@ def run_denoising_step_around(original, self, ctx, step, batch, server_args):
         return original(self, ctx, step, batch, server_args)
     if mask.eps is None:
         mask.eps = ctx.latents.detach().clone()  # the request's own initial noise
+    if state.DEBUG:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
     result = original(self, ctx, step, batch, server_args)
+    if state.DEBUG:
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
     ctx.latents = mask.blend(ctx.latents, _next_sigma(ctx.scheduler, step.step_index))
+    if state.DEBUG:
+        torch.cuda.synchronize()
+        logger.info(
+            "mtedit: mask step %d: step %.1f ms, blend %.2f ms, latents %s %s",
+            step.step_index, (t1 - t0) * 1e3, (time.perf_counter() - t1) * 1e3,
+            tuple(ctx.latents.shape), ctx.latents.dtype,
+        )
     return result
 
 
