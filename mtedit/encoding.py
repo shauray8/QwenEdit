@@ -38,6 +38,7 @@ from mtedit.request import MTRequest
 logger = logging.getLogger(__name__)
 
 MASK_EXTRA_KEY = "mt_mask"
+PREFILL_ONLY_KEY = "mt_prefill_only"
 
 
 class MTCaches(list):
@@ -192,6 +193,8 @@ def encoding_forward(self, batch, server_args):
 
     if mt.mask is not None:  # mt
         _prepare_mask(batch, mt, conditions, shapes, clean)
+    if mt.prefill_only:  # mt
+        batch.extra[PREFILL_ONLY_KEY] = True
 
     sched = self.scheduler.config
     batch.extra["qwen21_mu"] = calculate_linear_shift(
@@ -272,9 +275,10 @@ def annotate(image, spec):
     out = image.copy()
     draw = ImageDraw.Draw(out)
     width = max(1, int(round(spec.mark_width_px)))
-    color = tuple(spec.mark_color) + ((255,) if out.mode == "RGBA" else ())
-    for x0, y0, x1, y1 in spec.boxes:
-        draw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=color, width=width)
+    alpha = (255,) if out.mode == "RGBA" else ()
+    colors = spec.colors or [spec.mark_color] * len(spec.boxes)
+    for (x0, y0, x1, y1), rgb in zip(spec.boxes, colors):
+        draw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=tuple(rgb) + alpha, width=width)
     return out
 
 

@@ -29,6 +29,8 @@ class MaskSpec:
     annotate: bool = False
     mark_color: tuple[int, int, int] = (255, 0, 0)
     mark_width_px: float = 6.0
+    # optional per-box outline colors (multi-region edits name each box by its color)
+    colors: list[tuple[int, int, int]] | None = None
 
 
 @dataclass
@@ -39,6 +41,8 @@ class MTRequest:
     ref_latents: dict[int, str] = field(default_factory=dict)
     mask: MaskSpec | None = None
     prefix_cache: bool = True
+    # warm the prefix pools only: run the first denoising call (the prefill) and skip the rest
+    prefill_only: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MTRequest":
@@ -54,10 +58,12 @@ class MTRequest:
                 annotate=bool(mask.get("annotate", False)),
                 mark_color=tuple(int(c) for c in mask.get("mark_color", (255, 0, 0))),
                 mark_width_px=float(mask.get("mark_width_px", 6.0)),
+                colors=[tuple(int(c) for c in rgb) for rgb in mask["colors"]] if mask.get("colors") else None,
             )
             if mask
             else None,
             prefix_cache=bool(data.get("prefix_cache", True)),
+            prefill_only=bool(data.get("prefill_only", False)),
         )
 
     @classmethod

@@ -80,9 +80,9 @@ def run_scene(engine, name, photo, steps, seed0, cache):
             version = session.reroll(seed=seed)
         else:
             version = session.undo()
-        entry = dict(op=op, text=text, version=version.id, seconds=time.perf_counter() - t, path=version.image_path)
+        entry = dict(op=op, text=text, version=version.id, seconds=time.perf_counter() - t, path=session.path(version.id))
         if op != "undo" and version.boxes:
-            entry["outside_mean_max"] = outside(session.image(), Image.open(parent.image_path), version.boxes)
+            entry["outside_mean_max"] = outside(session.image(), Image.open(session.path(parent.id)), version.boxes)
         log.append(entry)
     return session, log
 
@@ -135,6 +135,7 @@ def main():
             c["identical_to_uncached"] = c["psnr_vs_uncached"] == float("inf")
             c["uncached_seconds"] = r["seconds"]
         report[name] = clog
+        cached.flush(); ref.flush()
         rows = [[cached.versions["v000"].image_path] + [e["path"] for e in clog],
                 [ref.versions["v000"].image_path] + [e["path"] for e in rlog]]
         boxes = [[None] + [cached.versions[e["version"]].boxes for e in clog]] * 2

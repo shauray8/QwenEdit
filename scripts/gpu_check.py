@@ -129,7 +129,7 @@ def main():
                    boxes=bx, seed=7)
         drift["passthrough" if passthrough else "vae_reencode"] = dict(
             outside_mean_max=outside_diff(s.image(), src, all_boxes),
-            final=s.current.image_path,
+            final=s.path(),
             seconds=[v.seconds for v in s.lineage()[1:]],
         )
     report["chain"] = drift

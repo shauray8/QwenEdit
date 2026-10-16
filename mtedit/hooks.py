@@ -8,7 +8,7 @@ import time
 import torch
 
 from mtedit import prefill, state
-from mtedit.encoding import MASK_EXTRA_KEY, MTCaches
+from mtedit.encoding import MASK_EXTRA_KEY, PREFILL_ONLY_KEY, MTCaches
 from mtedit.request import MTRequest
 
 logger = logging.getLogger(__name__)
@@ -160,6 +160,8 @@ def _next_sigma(scheduler, step_index: int):
 
 
 def run_denoising_step_around(original, self, ctx, step, batch, server_args):
+    if step.step_index > 0 and batch.extra.get(PREFILL_ONLY_KEY):
+        return None  # a warm-up request: the prefix is in the pools after step 0
     mask = batch.extra.get(MASK_EXTRA_KEY)
     if mask is None:
         return original(self, ctx, step, batch, server_args)

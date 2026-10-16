@@ -24,6 +24,8 @@ import threading
 import uuid
 from dataclasses import asdict
 
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse, Response
 from PIL import Image
 
 from mtedit.session import EditSession, Engine
@@ -44,9 +46,6 @@ def _describe(session: EditSession) -> dict:
 
 
 def create_app():
-    from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
-    from fastapi.responses import HTMLResponse, Response
-
     app = FastAPI(title="mtedit")
 
     def get(session_id: str) -> EditSession:
@@ -108,7 +107,7 @@ def create_app():
         session = get(session_id)
         if version not in session.versions:
             raise HTTPException(404, "no such version")
-        with open(session.versions[version].image_path, "rb") as f:
+        with open(session.path(version), "rb") as f:
             return Response(f.read(), media_type="image/png")
 
     @app.get("/", response_class=HTMLResponse)
@@ -133,7 +132,12 @@ def main():
 
     extra = {"component_quantizations": {"transformer": "convrot_int8"}} if args.int8 else {}
     _engine = Engine(args.model, out_dir=args.out, **extra)
-    uvicorn.run(create_app(), host=args.host, port=args.port)
+    try:
+        uvicorn.run(create_app(), host=args.host, port=args.port)
+    finally:
+        for session in _sessions.values():
+            session.flush()
+        _engine.shutdown()
 
 
 if __name__ == "__main__":
