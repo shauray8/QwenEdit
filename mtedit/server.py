@@ -78,6 +78,10 @@ def _configure(session: EditSession, body: dict) -> None:
         session.crop = bool(body["crop"])
     # follow-ups ("make it red") are rewritten against the history unless the client turns it off
     session.resolver = _resolver if body.get("context", True) else None
+    if "passthrough" in body:
+        session.passthrough = bool(body["passthrough"])
+    if "cumulative" in body:
+        session.cumulative = bool(body["cumulative"])
 
 
 def _regions(body: dict):

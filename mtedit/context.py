@@ -46,9 +46,39 @@ request: remove it
 {"instruction": "Remove the dog.", "mode": "remove", "target": 2}"""
 
 
+MERGE = """You combine a user's successive image-edit requests into ONE self-contained instruction for a single-turn image editing model. The model will apply it to the ORIGINAL image, so the instruction must describe every change requested so far.
+
+Rules: resolve references ("it", "that", "bigger") to the concrete object; later requests refine or override earlier ones ("make it red" after "add a sun" -> "Add a red sun"); if a later request undoes an earlier one, drop both; keep the user's wording and do not invent details; one or two sentences. Answer with the instruction only.
+
+Examples:
+requests: 1. add a sun  2. make it red  3. make it bigger
+Add a big red sun.
+
+requests: 1. add a cat on the sofa  2. make it night  3. remove the cat
+Make it night.
+
+requests: 1. add a hat on the man  2. make the background a beach
+Add a hat on the man and make the background a beach."""
+
+
 class Resolver:
     def __init__(self, url: str = "http://127.0.0.1:30001", model: str = "resolver", timeout: float = 20.0):
         self.url, self.model, self.timeout = url.rstrip("/"), model, timeout
+
+    def _chat(self, system: str, user: str, max_tokens: int) -> str:
+        body = {"model": self.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                "temperature": 0.0, "max_tokens": max_tokens}
+        req = urllib.request.Request(f"{self.url}/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=self.timeout) as response:
+            return (json.load(response)["choices"][0]["message"]["content"] or "").strip()
+
+    def merge(self, requests: list[str]) -> dict:
+        """All requests since the anchor image -> one instruction; {"instruction", "seconds"}."""
+        start = time.perf_counter()
+        text = self._chat(MERGE, "requests: " + "  ".join(f"{i + 1}. {r}" for i, r in enumerate(requests)), 120)
+        text = text.splitlines()[0].strip().strip('"') if text else ""
+        return {"instruction": text or requests[-1], "seconds": time.perf_counter() - start}
 
     def resolve(self, history: list[tuple[int, str]], request: str) -> dict:
         """history: [(id, instruction)]; returns {"instruction", "mode", "target", "seconds"}."""

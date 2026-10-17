@@ -71,6 +71,8 @@ class Version:
     prompt: str | None = None  # the exact prompt sent to the model
     resolved: dict | None = None  # context resolver output: instruction, mode, target
     change_box: Box | None = None  # where this edit actually changed the image (scene memory)
+    request: str | None = None  # what the user typed
+    base: str | None = None  # the version the model actually edited (the anchor for text edits)
     children: list[str] = field(default_factory=list)
 
 
@@ -175,9 +177,18 @@ def change_mask(new: Image.Image, old: Image.Image, threshold: float = 14.0, dil
     a = np.asarray(new.convert("RGB").resize(small, Image.Resampling.BILINEAR), np.float32)
     b = np.asarray(old.convert("RGB").resize(small, Image.Resampling.BILINEAR), np.float32)
     diff = np.abs(a - b).mean(-1)
-    hit = diff > threshold
+    hit = diff > max(threshold, 0.35 * float(diff.max()))  # strong changes only, not broad relighting
     if hit.mean() < min_area_frac:
         return None, None
+    try:  # keep the connected blob around the strongest change (the object, not stray drift)
+        from scipy import ndimage
+
+        labels, n = ndimage.label(ndimage.binary_closing(hit, iterations=2))
+        if n > 1:
+            peak = np.unravel_index(np.argmax(np.where(hit, diff, 0)), diff.shape)
+            hit = labels == labels[peak]
+    except ImportError:
+        pass
     ys, xs = np.nonzero(hit)
     box = (int(xs.min()) * 8, int(ys.min()) * 8, (int(xs.max()) + 1) * 8, (int(ys.max()) + 1) * 8)
     mask = Image.fromarray((hit * 255).astype(np.uint8)).resize((w, h), Image.Resampling.NEAREST)
@@ -237,7 +248,11 @@ class EditSession:
         self.sigmas = sigmas  # explicit schedule, e.g. a Turbo subset for drafts
         self.attention: str | None = None  # DiT-only attention override, e.g. "sage_attn"
         self.resolver = None  # mtedit.context.Resolver: makes follow-ups self-contained
-        self.modify_start_sigma = 0.85  # SDEdit start for boxed modify edits
+        self.modify_start_sigma = 0.85  # SDEdit start for boxed modify edits (opt-in)
+        self.sdedit_modify = False  # Turbo's distilled schedule leaves grain when started mid-way
+        # unboxed text edits re-edit the anchor (root or latest boxed result) with all requests
+        # since it merged into one instruction: no compounding artifacts across turns
+        self.cumulative = True
         self.crop, self.crop_margin_px, self.crop_min_px, self.crop_max_frac = crop, crop_margin_px, crop_min_px, crop_max_frac  # warm the next turn's prefix in the background after each edit
         self._io = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"mtedit-{session_id or 'io'}")
         self._saves: dict[str, Future] = {}
@@ -398,12 +413,27 @@ class EditSession:
         instruction; boxes and regions still drive the marks and the mask.
         """
         parent = self.versions[from_version or self.head]
-        refs = self._refs(parent)
+        base, request = parent, (instruction or "").strip()
+        merged = None
+        if (self.cumulative and self.resolver is not None and request and not boxes and not regions
+                and not raw_prompt):
+            lineage = self.lineage(parent.id)
+            anchor_index = max(i for i, v in enumerate(lineage) if v.parent is None or v.boxes or v.regions)
+            since = [v.request for v in lineage[anchor_index + 1:] if v.request]
+            if since:
+                try:
+                    merged = self.resolver.merge(since + [request])
+                    base = lineage[anchor_index]
+                except Exception as err:
+                    merged = {"error": str(err)}
+        refs = self._refs(base)
         canvas_ref = len(refs) - 1
         template = self.template if len(refs) == 2 else "{instruction}"
         instruction = (instruction or "").strip()
         resolved, sdedit = None, False
-        if self.resolver is not None and instruction and not regions and not raw_prompt:
+        if merged and "instruction" in merged:
+            instruction, resolved = merged["instruction"], {"mode": "merged", "base": base.id, **merged}
+        elif self.resolver is not None and instruction and not regions and not raw_prompt:
             lineage = [v for v in self.lineage(parent.id) if v.parent is not None]
             history = [(i + 1, v.instruction or "; ".join(t for _, t in (v.regions or []))) for i, v in enumerate(lineage)]
             try:
@@ -416,9 +446,9 @@ class EditSession:
                 if not boxes and target:  # "make it red": edit where the referenced object was made
                     ref = lineage[target - 1]
                     boxes = ref.boxes or ([tuple(b) for b, _ in ref.regions] if ref.regions else None)
-                    if not boxes and ref.change_box:  # an unboxed edit: use where it actually changed
-                        boxes = [_pad_box(ref.change_box, 24, self.size)]
-                sdedit = resolved.get("mode") == "modify" and bool(boxes)
+                    # an unboxed earlier edit: no box; the model finds "the sun" itself (pixel-diff
+                    # guesses pick the wrong blob, e.g. the sun's reflection)
+                sdedit = self.sdedit_modify and resolved.get("mode") == "modify" and bool(boxes)
         colors = None
         if regions:  # per-box instructions: one outline color per box, named in the prompt
             if len(regions) > len(MARK_PALETTE):
@@ -428,7 +458,11 @@ class EditSession:
             colors = [MARK_PALETTE[i][1] for i in range(len(regions))]
             task = REGION_TEMPLATE.format(regions=" ".join(parts) + " ", instruction=instruction).replace("  ", " ")
         elif boxes and self.mark_boxes:
-            task = self.box_template.format(instruction=instruction)
+            # never outline in a color the instruction names ("make it red" gets a blue box)
+            free = [(n, c) for n, c in MARK_PALETTE if n not in instruction.lower()] or MARK_PALETTE
+            mark_name, mark_rgb = free[0]
+            colors = [mark_rgb] * len(boxes)
+            task = self.box_template.replace("red box", f"{mark_name} box").format(instruction=instruction)
         else:
             task = instruction
         if raw_prompt:
@@ -456,7 +490,7 @@ class EditSession:
             if colors:
                 mt["mask"]["colors"] = [list(c) for c in colors]
         seed = int(time.time_ns() % (2**31)) if seed is None else seed
-        source = self._image_cache.get(parent.id) or Image.open(self.path(parent.id))
+        source = self._image_cache.get(base.id) or Image.open(self.path(base.id))
         window = self.crop_rect(boxes) if boxes and self.crop else None
 
         start = time.perf_counter()
@@ -470,11 +504,8 @@ class EditSession:
             out = out.convert(source.mode)
             if boxes and self.paste_back:
                 out = Image.composite(out, source, pixel_mask(out.size, boxes, feather_px, grow_px))
-            elif not boxes and self.paste_back and resolved and resolved.get("mode") in ("add", "modify", "remove"):
-                # an unboxed local edit: keep only where it changed, so the rest cannot drift
-                changed, _ = change_mask(out, source)
-                if changed is not None:
-                    out = Image.composite(out, source, changed)
+            # unboxed edits are kept whole: soft effects (glow, shadows, reflections) do not survive
+            # a hard change mask; the change box is still measured below for scene memory
         else:
             out, result, latent_id = self._crop_edit(
                 parent, source, window, task, boxes, colors, regions, seed, feather_px, grow_px, vid, latent_id,
@@ -495,7 +526,7 @@ class EditSession:
             id=vid, parent=parent.id, image_path=path, instruction=instruction, regions=regions,
             boxes=boxes, feather_px=feather_px, grow_px=grow_px, seed=seed,
             latent_id=latent_id, seconds=seconds, timings=timings, prompt=prompt, resolved=resolved,
-            change_box=change_box,
+            change_box=change_box, request=request or None, base=base.id,
         )
         self.versions[vid] = version
         parent.children.append(vid)
@@ -545,6 +576,6 @@ class EditSession:
         if head.parent is None:
             raise ValueError("nothing to re-roll at the root")
         return self.edit(
-            head.instruction or "", boxes=None if head.regions else head.boxes, regions=head.regions, seed=seed,
+            (head.request if head.request is not None else head.instruction) or "", boxes=None if head.regions else head.boxes, regions=head.regions, seed=seed,
             feather_px=head.feather_px, grow_px=head.grow_px, from_version=head.parent,
         )
