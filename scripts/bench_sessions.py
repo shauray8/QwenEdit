@@ -30,6 +30,7 @@ def main():
     ap.add_argument("--bcg", action="store_true", help="SGLang breakable CUDA graphs for the DiT")
     ap.add_argument("--attention", default="sage_attn", help="DiT attention override (sage_attn, sage_attn_3, none)")
     ap.add_argument("--speed", default="quality", choices=["quality", "fast", "draft"])
+    ap.add_argument("--mp", type=float, default=1.0, help="working megapixels (4 = 2K)")
     args = ap.parse_args()
 
     from mtedit.session import EditSession, Engine
@@ -37,18 +38,22 @@ def main():
     from mtedit.session import SPEED_PRESETS
 
     extra = {"component_quantizations": {"transformer": "convrot_int8"}} if args.int8 else {}
-    if args.bcg:
+    attention = None if args.attention == "none" else args.attention
+    if args.bcg:  # graphs bake the attention kernel in: set it server-side for the DiT only
         extra["enable_breakable_cuda_graph"] = True
-    engine = Engine(args.model, out_dir=args.out, attention=None if args.attention == "none" else args.attention, **extra)
+        if attention:
+            extra["component_attention_backends"] = {"transformer": attention}
+        attention = None
+    engine = Engine(args.model, out_dir=args.out, attention=attention, **extra)
     sigmas = SPEED_PRESETS[args.speed]
     # warm kernels, allocator and pools on a throwaway session
-    warm = EditSession(engine, os.path.join(args.photos, "972a_cat.png"), session_id="warm")
+    warm = EditSession(engine, os.path.join(args.photos, "972a_cat.png"), session_id="warm", megapixels=args.mp)
     warm.edit("Make the image slightly warmer.", seed=1)
     warm.edit("Add a red ball.", boxes=[(10, 10, 200, 200)], seed=2)
 
     rows = []
     for name, (photo, steps) in SCENES.items():
-        session = EditSession(engine, os.path.join(args.photos, photo), session_id=f"{name}_{args.tag}", sigmas=sigmas)
+        session = EditSession(engine, os.path.join(args.photos, photo), session_id=f"{name}_{args.tag}", sigmas=sigmas, megapixels=args.mp)
         w, h = session.size
         for index, (op, text, frac) in enumerate(steps):
             boxes = [(a * w, b * h, c * w, d * h) for a, b, c, d in frac] if frac else None
@@ -63,7 +68,7 @@ def main():
             timings = session.current.timings
             rows.append(dict(scene=name, op=op, boxed=bool(boxes), seconds=time.perf_counter() - t, timings=timings))
             print(f"[{args.tag}] {name} {op} {rows[-1]['seconds']:.3f}s " +
-                  " ".join(f"{k}={v:.3f}" for k, v in timings.items()), flush=True)
+                  " ".join(f"{k}={v:.3f}" for k, v in timings.items() if isinstance(v, float)), flush=True)
     summary = dict(
         tag=args.tag,
         total=sum(r["seconds"] for r in rows),

@@ -57,6 +57,8 @@ class MTRequest:
     sigmas: list[float] | None = None
     # reference area relative to the target (e.g. 0.25: a 1K reference for a 2K output); unboxed edits only
     ref_scale: float = 1.0
+    # progressive resolution: the first ``progressive`` steps run at half width/height (unmasked edits only)
+    progressive: int = 0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MTRequest":
@@ -84,6 +86,7 @@ class MTRequest:
             store_ref_as={int(k): str(v) for k, v in (data.get("store_ref_as") or {}).items()},
             sigmas=[float(x) for x in data["sigmas"]] if data.get("sigmas") else None,
             ref_scale=float(data.get("ref_scale", 1.0)),
+            progressive=int(data.get("progressive", 0)),
         )
 
     @classmethod

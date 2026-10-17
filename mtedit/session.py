@@ -307,6 +307,7 @@ class EditSession:
         # boxed edits generate only a crop around the boxes (+ context margin) when it is small enough
         self.sigmas = sigmas  # explicit schedule, e.g. a Turbo subset for drafts
         self.ref_scale = ref_scale  # unboxed edits: reference area / target area
+        self.progressive = 0  # unboxed edits: first N steps at half resolution
         self.attention: str | None = None  # DiT-only attention override, e.g. "sage_attn"
         self.resolver = None  # mtedit.context.Resolver: makes follow-ups self-contained
         self.modify_start_sigma = 0.85  # SDEdit start for boxed modify edits (opt-in)
@@ -536,6 +537,8 @@ class EditSession:
         mt: dict = {"store_output_as": latent_id, "prefix_cache": self.cache}
         if self.ref_scale != 1.0 and not boxes:
             mt["ref_scale"] = self.ref_scale
+        if self.progressive and not boxes:
+            mt["progressive"] = self.progressive
         if sigmas:
             mt["sigmas"] = list(sigmas)
         if self.passthrough:

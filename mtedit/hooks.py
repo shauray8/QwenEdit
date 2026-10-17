@@ -8,7 +8,7 @@ import time
 import torch
 
 from mtedit import prefill, state
-from mtedit.encoding import MASK_EXTRA_KEY, PREFILL_ONLY_KEY, MTCaches
+from mtedit.encoding import MASK_EXTRA_KEY, PREFILL_ONLY_KEY, PROGRESSIVE_KEY, MTCaches
 from mtedit.request import MTRequest
 
 logger = logging.getLogger(__name__)
@@ -169,9 +169,46 @@ def _next_sigma(scheduler, step_index: int):
     return sigmas[index] if index < len(sigmas) else sigmas.new_zeros(())
 
 
+def _swap_layouts(batch, layouts_by_branch):
+    for branch, layouts in layouts_by_branch.items():
+        cond = batch.extra.get(branch)
+        if cond is not None:
+            cond["layouts"][:] = layouts  # in place: the kwargs dict holds this list
+
+
+def _progressive_step(original, self, ctx, step, batch, server_args, prog):
+    """Steps < k at half resolution; at the switch, upsample x0 and re-noise with the full-res noise."""
+    import torch.nn.functional as F
+
+    H, W = prog["hw"]
+    if step.step_index == 0:
+        prog["eps"] = ctx.latents.detach().clone()  # [B, H*W, C] full-res initial noise
+        b, _, c = ctx.latents.shape
+        ctx.latents = ctx.latents.view(b, H, W, c)[:, ::2, ::2].reshape(b, (H // 2) * (W // 2), c).contiguous()
+        prog["full"] = {k: list(batch.extra[k]["layouts"]) for k in prog["low"] if k in batch.extra}
+        _swap_layouts(batch, prog["low"])
+    before = ctx.latents
+    result = original(self, ctx, step, batch, server_args)
+    if step.step_index == prog["steps"] - 1:
+        sigmas = ctx.scheduler.sigmas
+        s0, s1 = sigmas[step.step_index], sigmas[step.step_index + 1]
+        v = (ctx.latents - before) / (s1 - s0)
+        x0 = ctx.latents - s1 * v
+        b, _, c = x0.shape
+        x0 = x0.view(b, H // 2, W // 2, c).permute(0, 3, 1, 2)
+        x0 = F.interpolate(x0.float(), size=(H, W), mode="bilinear", align_corners=False).to(ctx.latents.dtype)
+        x0 = x0.permute(0, 2, 3, 1).reshape(b, H * W, c)
+        ctx.latents = (1 - s1) * x0 + s1 * prog["eps"].to(x0)
+        _swap_layouts(batch, prog["full"])
+    return result
+
+
 def run_denoising_step_around(original, self, ctx, step, batch, server_args):
     if step.step_index > 0 and batch.extra.get(PREFILL_ONLY_KEY):
         return None  # a warm-up request: the prefix is in the pools after step 0
+    prog = batch.extra.get(PROGRESSIVE_KEY)
+    if prog and step.step_index < prog["steps"]:
+        return _progressive_step(original, self, ctx, step, batch, server_args, prog)
     mask = batch.extra.get(MASK_EXTRA_KEY)
     if mask is None:
         return original(self, ctx, step, batch, server_args)

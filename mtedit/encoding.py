@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 MASK_EXTRA_KEY = "mt_mask"
 PREFILL_ONLY_KEY = "mt_prefill_only"
+PROGRESSIVE_KEY = "mt_progressive"
 
 
 class MTCaches(list):
@@ -159,12 +160,18 @@ def encoding_forward(self, batch, server_args):
     root = state.dit_root(server_args) if use_store else None
     image_shapes = [(h, w) for _, h, w in shapes[:-1]]
 
+    progressive = mt.progressive if (mt.mask is None and batch.height % 32 == 0 and batch.width % 32 == 0) else 0
+    low_shape = (1, batch.height // 32, batch.width // 32)
+    branch_low = {}
     for negative in [False, True] if batch.do_classifier_free_guidance else [False]:
         embeds, masks, layouts, all_vids = [], [], [], []
+        low_layouts = []
         for prompt in negatives if negative else prompts:
             with set_forward_context(current_timestep=None, attn_metadata=None, forward_batch=batch):
                 hidden, slots = _encode_prompt(self, prompt, resized, device, pixel_keys, mt)  # mt
             layout = build_layout(slots.tolist(), shapes, config.dit_config.axes_dims_rope, device)
+            if progressive:  # mt: the same prefix, a half-resolution target
+                low_layouts.append(build_layout(slots.tolist(), shapes[:-1] + [low_shape], config.dit_config.axes_dims_rope, device))
             vids = None
             if use_store:  # mt
                 vids = _vids_for(self, root, prompt, layout, hidden, image_keys, image_shapes)
@@ -190,6 +197,9 @@ def encoding_forward(self, batch, server_args):
         caches = [[{} for _ in range(config.dit_config.num_layers)] for _ in range(sample_count)]
         if use_store:  # mt
             caches = MTCaches(caches, all_vids, [l["prefix_rope"].shape[0] for l in layouts])
+        if progressive:
+            branch_low["qwen21_negative" if negative else "qwen21_positive"] = [
+                l for l in low_layouts for _ in range(batch.num_outputs_per_prompt)]
         batch.extra["qwen21_negative" if negative else "qwen21_positive"] = dict(
             layouts=layouts,
             condition_latents=condition_latents,
@@ -198,6 +208,8 @@ def encoding_forward(self, batch, server_args):
 
     if mt.mask is not None:  # mt
         _prepare_mask(batch, mt, conditions, shapes, clean)
+    if progressive:  # mt
+        batch.extra[PROGRESSIVE_KEY] = {"steps": progressive, "low": branch_low, "hw": (batch.height // 16, batch.width // 16)}
     if mt.prefill_only:  # mt
         batch.extra[PREFILL_ONLY_KEY] = True
 

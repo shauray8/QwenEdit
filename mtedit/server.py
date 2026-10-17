@@ -54,6 +54,7 @@ def _scaled(size, megapixels):
 _engine: Engine | None = None
 _enhancer = None
 _resolver = None
+_graphs = False
 _sessions: dict[str, EditSession] = {}
 _thumbs: dict[tuple, bytes] = {}
 _lock = threading.Lock()
@@ -95,7 +96,12 @@ def _configure(session: EditSession, body: dict) -> None:
     attention = body.get("attention", "sage2")
     if attention not in ATTENTIONS:
         raise HTTPException(400, f"attention must be one of {list(ATTENTIONS)}")
-    session.attention = ATTENTIONS[attention]
+    # with CUDA graphs the DiT's attention is fixed server-side (Sage2); per-request overrides are refused
+    session.attention = None if _graphs else ATTENTIONS[attention]
+    # progressive resolution for unboxed edits at >= 1.5K: the first ~3/8 of the steps at half size
+    steps = len(SPEED_PRESETS[speed] or [0] * 8)
+    session.progressive = round(3 * steps / 8) if body.get("progressive", True) and \
+        session.size[0] * session.size[1] >= 2.0 * 1024 * 1024 else 0
     if "crop" in body:
         session.crop = bool(body["crop"])
     # follow-ups ("make it red") are rewritten against the history unless the client turns it off
@@ -261,7 +267,7 @@ def create_app() -> FastAPI:
 
 
 def main():
-    global _engine, _enhancer, _resolver
+    global _engine, _enhancer, _resolver, _graphs
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen-Image-2.1-Turbo")
     ap.add_argument("--int8", action="store_true", help="online INT8 ConvRot DiT (needs CUDA_HOME at CUDA 13)")
@@ -271,11 +277,15 @@ def main():
     ap.add_argument("--share", action="store_true", help="public *.gradio.live link via Gradio's share tunnel")
     ap.add_argument("--enhancer-url", default=None, help="SGLang server running Qwen/Qwen-Image-2.1-PE-I2I")
     ap.add_argument("--resolver-url", default=None, help="SGLang server running a small instruct LLM for follow-ups")
+    ap.add_argument("--no-graphs", action="store_true", help="disable breakable CUDA graphs for the DiT")
     args = ap.parse_args()
 
     import uvicorn
 
     extra = {"component_quantizations": {"transformer": "convrot_int8"}} if args.int8 else {}
+    if not args.no_graphs:  # -17% per 1K edit; graphs bake attention in, so Sage2 is set for the DiT only
+        _graphs = True
+        extra.update(enable_breakable_cuda_graph=True, component_attention_backends={"transformer": "sage_attn"})
     _engine = Engine(args.model, out_dir=args.out, **extra)
     os.chdir(_engine.out_dir)  # never inside the code tree: syncs must not remove the working directory
     if args.enhancer_url:

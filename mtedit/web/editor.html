@@ -201,6 +201,7 @@ aside .head h3 { margin: 0 auto 0 0; font-size: 13px; }
   <label>Reference detail <select id="optRef"><option value="full">Full</option><option value="1.5k" selected>1.5K · faster</option><option value="1k">1K · fastest</option></select></label>
   <label>Crop boxed edits <input type="checkbox" id="optCrop" checked></label>
   <label>DiT attention <select id="optAttn"></select></label>
+  <label>Progressive (2K) <input type="checkbox" id="optProg" checked></label>
   <label>Edge feather <input type="range" id="optFeather" min="0" max="48" step="4" value="16"></label>
   <label>Seed <input type="number" id="optSeed" placeholder="random"></label>
   <label>Follow-up context <input type="checkbox" id="optContext" checked></label>
@@ -355,7 +356,7 @@ async function run(fn, label = "Editing") {
 }
 function common() {
   const seed = $("optSeed").value;
-  return { speed: S.speed, ref: $("optRef").value, context: $("optContext").checked, crop: $("optCrop").checked, attention: $("optAttn").value, feather: +$("optFeather").value, seed: seed === "" ? null : +seed };
+  return { speed: S.speed, progressive: $("optProg").checked, ref: $("optRef").value, context: $("optContext").checked, crop: $("optCrop").checked, attention: $("optAttn").value, feather: +$("optFeather").value, seed: seed === "" ? null : +seed };
 }
 async function doEdit() {
   if (!S.session) return;
