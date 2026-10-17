@@ -16,6 +16,7 @@ latents and the session pastes the source pixels back outside a feathered mask.
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 import uuid
@@ -152,6 +153,17 @@ def _to_pil(result) -> Image.Image:
     if frame.dtype != np.uint8:
         frame = (np.clip(frame, 0, 1) * 255).round().astype(np.uint8)
     return Image.fromarray(frame)
+
+
+_REFERRING = re.compile(
+    r"\b(it|its|them|they|their|that|those|this|these|him|her|his|he|she|one|ones|again|instead|"
+    r"more|less|bigger|smaller|larger|darker|lighter|brighter|redder|longer|shorter|wider|taller|too|"
+    r"same|other|rather)\b", re.I)
+
+
+def _may_refer(request: str) -> bool:
+    """Cheap gate before asking the resolver whether this is a follow-up of the last edit."""
+    return len(request.split()) <= 4 or bool(_REFERRING.search(request))
 
 
 def _pad_box(box, pad, size):
@@ -484,7 +496,8 @@ class EditSession:
             # only that edit, from its own base, with both merged; anything else edits the current image,
             # so earlier edits you liked are never redone
             last = parent
-            if last.parent is not None and last.request and not last.boxes and not last.regions:
+            if last.parent is not None and last.request and not last.boxes and not last.regions \
+                    and _may_refer(request):
                 try:
                     probe = self.resolver.resolve([(1, last.instruction or last.request)], request)
                     if probe.get("target") == 1:
@@ -598,7 +611,8 @@ class EditSession:
         self.versions[vid] = version
         parent.children.append(vid)
         self.head = vid
-        if self.auto_prewarm:
+        # prewarm only where it is cheap: at 2K it holds the GPU ~1-1.5 s and a quick next edit waits on it
+        if self.auto_prewarm and self.size[0] * self.size[1] <= 1.6 * 1024 * 1024:
             self.prewarm(vid)
         return version
 
