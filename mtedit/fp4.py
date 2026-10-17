@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 ENABLED = os.environ.get("MTEDIT_NVFP4", "0") == "1"
 _FP4_MAX, _FP8_MAX = 6.0, 448.0
 _converted: set[int] = set()
+_BACKEND = os.environ.get("MTEDIT_NVFP4_BACKEND", "b12x")  # fastest mm_fp4 backend at Q21 shapes on sm_120
 
 
 def _global_scale(t: torch.Tensor) -> torch.Tensor:
@@ -61,7 +62,7 @@ class NVFP4Weight:
         import flashinfer
 
         return flashinfer.mm_fp4(xq, self.wq.t(), xsf, self.wsf.t(), (1.0 / (gx * self.gw)).to(torch.float32),
-                                 torch.bfloat16, backend="cutlass")
+                                 torch.bfloat16, backend=_BACKEND)
 
 
 class NVFP4Linear(nn.Module):

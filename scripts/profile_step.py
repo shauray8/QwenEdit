@@ -11,7 +11,7 @@ def main():
     from mtedit.session import EditSession, Engine
     extra = {"component_quantizations": {"transformer": "convrot_int8"}} if args.int8 else {}
     engine = Engine("Qwen/Qwen-Image-2.1-Turbo", out_dir="/workspace/mt/prof", attention=args.attention, **extra)
-    s = EditSession(engine, "/workspace/mt/photos/972a_cat.png", session_id="prof", crop=False)
+    s = EditSession(engine, "/workspace/mt/photos/972a_cat.png", session_id="prof", crop=False, megapixels=float(os.environ.get("MP", "1")))
     s.edit("Make it warmer.", seed=1)                      # calls 0-7
     s.edit("Add a red scarf.", seed=2, from_version="v000")  # calls 8-15; 12 = a mid step
     engine.shutdown()
