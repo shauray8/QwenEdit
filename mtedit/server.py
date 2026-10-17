@@ -88,6 +88,10 @@ def _configure(session: EditSession, body: dict) -> None:
     session.resolver = _resolver if body.get("context", True) else None
     if "passthrough" in body:
         session.passthrough = bool(body["passthrough"])
+    # unboxed edits read a smaller reference (cuts the K/V the target attends to; crops stay sharp)
+    cap = {"full": None, "1.5k": 2.25, "1k": 1.0}.get(body.get("ref", "1.5k"))
+    mp = session.size[0] * session.size[1] / (1024 * 1024)
+    session.ref_scale = 1.0 if cap is None else min(1.0, cap / mp)
     if "cumulative" in body:
         session.cumulative = bool(body["cumulative"])
 

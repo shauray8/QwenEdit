@@ -163,7 +163,7 @@ def _round32(value: float) -> int:
 
 
 def change_mask(new: Image.Image, old: Image.Image, threshold: float = 14.0, dilate_px: int = 24,
-                min_area_frac: float = 0.0005):
+                min_area_frac: float = 0.0005, box_only: bool = False):
     """Where ``new`` differs from ``old``: (feathered L mask, bounding box) or (None, None).
 
     Computed on a 1/8 grid (fast, ignores pixel noise), then dilated so the kept
@@ -191,6 +191,8 @@ def change_mask(new: Image.Image, old: Image.Image, threshold: float = 14.0, dil
         pass
     ys, xs = np.nonzero(hit)
     box = (int(xs.min()) * 8, int(ys.min()) * 8, (int(xs.max()) + 1) * 8, (int(ys.max()) + 1) * 8)
+    if box_only:  # the full-resolution mask (a slow max-filter at 4 MP) is only needed for compositing
+        return None, box
     mask = Image.fromarray((hit * 255).astype(np.uint8)).resize((w, h), Image.Resampling.NEAREST)
     mask = mask.filter(ImageFilter.MaxFilter(2 * (dilate_px // 2) + 1)).filter(ImageFilter.GaussianBlur(dilate_px / 3))
     return mask, box
@@ -231,6 +233,7 @@ class EditSession:
         crop_max_frac: float = 0.55,
         sigmas: list[float] | None = None,
         megapixels: float = 1.0,
+        ref_scale: float = 1.0,
     ):
         if layout not in ("chain", "anchor"):
             raise ValueError("layout must be 'chain' or 'anchor'")
@@ -247,6 +250,7 @@ class EditSession:
         self.auto_prewarm = prewarm
         # boxed edits generate only a crop around the boxes (+ context margin) when it is small enough
         self.sigmas = sigmas  # explicit schedule, e.g. a Turbo subset for drafts
+        self.ref_scale = ref_scale  # unboxed edits: reference area / target area
         self.attention: str | None = None  # DiT-only attention override, e.g. "sage_attn"
         self.resolver = None  # mtedit.context.Resolver: makes follow-ups self-contained
         self.modify_start_sigma = 0.85  # SDEdit start for boxed modify edits (opt-in)
@@ -478,6 +482,8 @@ class EditSession:
             sigmas = [s for s in (sigmas or TURBO_SIGMAS) if s <= self.modify_start_sigma] or None
         attention = attention or self.attention
         mt: dict = {"store_output_as": latent_id, "prefix_cache": self.cache}
+        if self.ref_scale != 1.0 and not boxes:
+            mt["ref_scale"] = self.ref_scale
         if sigmas:
             mt["sigmas"] = list(sigmas)
         if self.passthrough:
@@ -522,7 +528,7 @@ class EditSession:
         timings = dict(generate=generated - start, post=posted - generated, save=time.perf_counter() - posted,
                        crop=list(window) if window else None)
 
-        _, change_box = change_mask(out, source) if self.paste_back else (None, None)
+        change_box = change_mask(out, source, box_only=True)[1] if self.paste_back else None
         version = Version(
             id=vid, parent=parent.id, image_path=path, instruction=instruction, regions=regions,
             boxes=boxes, feather_px=feather_px, grow_px=grow_px, seed=seed,

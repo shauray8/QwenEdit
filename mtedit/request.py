@@ -55,6 +55,8 @@ class MTRequest:
     store_ref_as: dict[int, str] = field(default_factory=dict)
     # explicit sigma schedule (e.g. a subset of Turbo's 8 distilled sigmas for a faster draft)
     sigmas: list[float] | None = None
+    # reference area relative to the target (e.g. 0.25: a 1K reference for a 2K output); unboxed edits only
+    ref_scale: float = 1.0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MTRequest":
@@ -81,6 +83,7 @@ class MTRequest:
             compose=data.get("compose"),
             store_ref_as={int(k): str(v) for k, v in (data.get("store_ref_as") or {}).items()},
             sigmas=[float(x) for x in data["sigmas"]] if data.get("sigmas") else None,
+            ref_scale=float(data.get("ref_scale", 1.0)),
         )
 
     @classmethod

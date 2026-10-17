@@ -82,7 +82,7 @@ def encoding_forward(self, batch, server_args):
     images = batch.condition_image
     images = [] if images is None else images if isinstance(images, list) else [images]
     resized, shapes, conditions = [], [], []
-    area = batch.height * batch.width
+    area = batch.height * batch.width * (mt.ref_scale if mt.mask is None else 1.0)  # mt: smaller references
     image_mode = "RGBA" if ac.in_channels == 4 else "RGB"
     for image in images:
         if not isinstance(image, Image.Image):
