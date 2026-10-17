@@ -318,7 +318,10 @@ function show(data, { keepBoxes = false } = {}) {
   S.session = data;
   $("empty").hidden = true; $("frame").hidden = false; $("dock").classList.add("on");
   const head = data.versions[data.head];
-  $("img").src = imageUrl(data.head);
+  // instant: the JPEG preview that came with the response; then the full PNG once it has loaded
+  const full = imageUrl(data.head);
+  $("img").src = data.preview || full;
+  if (data.preview) { const pre = new Image(); pre.onload = () => { if (S.session?.head === data.head && !S.compare) $("img").src = full; }; pre.src = full; }
   $("download").href = imageUrl(data.head); $("download").setAttribute("download", `${data.id}_${data.head}.png`);
   if (!keepBoxes) { S.boxes = []; S.sel = -1; }
   layout();

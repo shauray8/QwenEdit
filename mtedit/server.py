@@ -59,10 +59,24 @@ _thumbs: dict[tuple, bytes] = {}
 _lock = threading.Lock()
 
 
-def _describe(session: EditSession) -> dict:
+def _preview(session: EditSession, version: str, w: int = 1600) -> str:
+    """The version as a ~1600 px JPEG data URL, sent with the response so the canvas updates at once."""
+    import base64
+
+    image = session.image(version).convert("RGB")
+    image.thumbnail((w, w))
+    buf = io.BytesIO()
+    image.save(buf, "JPEG", quality=88)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _describe(session: EditSession, preview: bool = False) -> dict:
     versions = {vid: {k: val for k, val in asdict(v).items() if k != "image_path"} for vid, v in session.versions.items()}
-    return {"id": session.id, "head": session.head, "size": list(session.size), "layout": session.layout,
-            "versions": versions, "order": list(session.versions)}
+    out = {"id": session.id, "head": session.head, "size": list(session.size), "layout": session.layout,
+           "versions": versions, "order": list(session.versions)}
+    if preview:
+        out["preview"] = _preview(session, session.head)
+    return out
 
 
 def _session(session_id: str) -> EditSession:
@@ -154,7 +168,7 @@ def create_app() -> FastAPI:
             image, latent_id = _engine.text_to_image(prompt, width=width, height=height,
                                                      seed=None if seed in (None, "", -1) else int(seed))
             session = _new_session(image, root_latent_id=latent_id, megapixels=mp)
-        return _describe(session)
+        return _describe(session, preview=True)
 
     @app.post("/api/sessions")
     async def upload(image: UploadFile = File(...), resolution: str = "1k"):
@@ -183,7 +197,7 @@ def create_app() -> FastAPI:
                 seed=None if seed in (None, "", -1) else int(seed), feather_px=float(body.get("feather", 16)),
                 from_version=body.get("from_version"),
             )
-        return {"version": version.id, **_describe(session)}
+        return {"version": version.id, **_describe(session, preview=True)}
 
     @app.post("/api/sessions/{session_id}/reroll")
     def reroll(session_id: str, body: dict = Body(default={})):
@@ -194,13 +208,13 @@ def create_app() -> FastAPI:
         with _lock:
             _configure(session, body)
             version = session.reroll(seed=None if seed in (None, "", -1) else int(seed))
-        return {"version": version.id, **_describe(session)}
+        return {"version": version.id, **_describe(session, preview=True)}
 
     @app.post("/api/sessions/{session_id}/undo")
     def undo(session_id: str):
         session = _session(session_id)
         session.undo()
-        return _describe(session)
+        return _describe(session, preview=True)
 
     @app.post("/api/sessions/{session_id}/checkout")
     def checkout(session_id: str, body: dict = Body(...)):
@@ -209,7 +223,7 @@ def create_app() -> FastAPI:
             session.checkout(body["version"])
         except KeyError:
             raise HTTPException(404, "no such version")
-        return _describe(session)
+        return _describe(session, preview=True)
 
     @app.post("/api/sessions/{session_id}/enhance")
     def enhance(session_id: str, body: dict = Body(default={})):
