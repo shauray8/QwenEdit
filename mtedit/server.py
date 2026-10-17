@@ -42,6 +42,14 @@ ASPECTS = {
     "2:3": (832, 1248), "16:9": (1344, 768), "9:16": (768, 1344),
 }
 ATTENTIONS = {"sdpa": None, "sage2": "sage_attn", "sage3": "sage_attn_3"}
+# working resolution: the Turbo card edits at 2048x2048 (~4 MP); 1K is fastest
+RESOLUTIONS = {"1k": 1.0, "1.5k": 2.25, "2k": 4.0}
+
+
+def _scaled(size, megapixels):
+    w, h = size
+    s = (megapixels / ((w * h) / (1024 * 1024))) ** 0.5
+    return max(32, round(w * s / 32) * 32), max(32, round(h * s / 32) * 32)
 
 _engine: Engine | None = None
 _enhancer = None
@@ -107,8 +115,8 @@ def _regions(body: dict):
     return (instruction if all(labeled) else ""), None, regions
 
 
-def _new_session(image: Image.Image, root_latent_id=None) -> EditSession:
-    session = EditSession(_engine, image, prewarm=True, root_latent_id=root_latent_id,
+def _new_session(image: Image.Image, root_latent_id=None, megapixels: float = 1.0) -> EditSession:
+    session = EditSession(_engine, image, prewarm=True, root_latent_id=root_latent_id, megapixels=megapixels,
                           size=image.size if root_latent_id else None, session_id=uuid.uuid4().hex[:8])
     _sessions[session.id] = session
     if root_latent_id is None:
@@ -127,7 +135,7 @@ def create_app() -> FastAPI:
     @app.get("/api/config")
     def config():
         return {"speeds": list(SPEED_PRESETS), "attentions": list(ATTENTIONS), "aspects": ASPECTS,
-                "palette": [{"name": n, "rgb": c} for n, c in MARK_PALETTE], "enhancer": _enhancer is not None, "context": _resolver is not None,
+                "palette": [{"name": n, "rgb": c} for n, c in MARK_PALETTE], "enhancer": _enhancer is not None, "context": _resolver is not None, "resolutions": list(RESOLUTIONS),
                 "model": _engine.model_path}
 
     @app.post("/api/generate")
@@ -135,20 +143,21 @@ def create_app() -> FastAPI:
         prompt = (body.get("prompt") or "").strip()
         if not prompt:
             raise HTTPException(400, "write a prompt")
-        width, height = ASPECTS.get(body.get("aspect", "1:1"), (1024, 1024))
+        mp = RESOLUTIONS.get(body.get("resolution", "1k"), 1.0)
+        width, height = _scaled(ASPECTS.get(body.get("aspect", "1:1"), (1024, 1024)), mp)
         seed = body.get("seed")
         with _lock:
             image, latent_id = _engine.text_to_image(prompt, width=width, height=height,
                                                      seed=None if seed in (None, "", -1) else int(seed))
-            session = _new_session(image, root_latent_id=latent_id)
+            session = _new_session(image, root_latent_id=latent_id, megapixels=mp)
         return _describe(session)
 
     @app.post("/api/sessions")
-    async def upload(image: UploadFile = File(...)):
+    async def upload(image: UploadFile = File(...), resolution: str = "1k"):
         pil = Image.open(io.BytesIO(await image.read()))
         pil.load()
         with _lock:
-            session = _new_session(pil)
+            session = _new_session(pil, megapixels=RESOLUTIONS.get(resolution, 1.0))
         return _describe(session)
 
     @app.get("/api/sessions/{session_id}")

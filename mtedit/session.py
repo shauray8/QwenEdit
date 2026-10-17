@@ -230,6 +230,7 @@ class EditSession:
         crop_min_px: int = 512,
         crop_max_frac: float = 0.55,
         sigmas: list[float] | None = None,
+        megapixels: float = 1.0,
     ):
         if layout not in ("chain", "anchor"):
             raise ValueError("layout must be 'chain' or 'anchor'")
@@ -262,8 +263,8 @@ class EditSession:
         os.makedirs(self.dir, exist_ok=True)
 
         image = base_image if isinstance(base_image, Image.Image) else Image.open(base_image)
-        if size is None:  # keep the aspect, ~1 MP, multiples of 32
-            scale = (1024 * 1024 / (image.width * image.height)) ** 0.5
+        if size is None:  # keep the aspect at the requested megapixels (the model card edits at ~4 MP), 32-multiples
+            scale = (megapixels * 1024 * 1024 / (image.width * image.height)) ** 0.5
             size = (_round32(image.width * scale), _round32(image.height * scale))
         self.size = size
         # every version, including the root, lives at the target size so slots keep their shapes
