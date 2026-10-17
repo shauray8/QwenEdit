@@ -540,6 +540,8 @@ class EditSession:
                 # no silent box reuse: an edit without a drawn box has no box (and no box wording)
                 sdedit = self.sdedit_modify and resolved.get("mode") == "modify" and bool(boxes)
         colors = None
+        # one chain: labeled boxes (regions), a two-box move, plain boxes, or text only
+        move = not regions and bool(boxes) and len(boxes) == 2 and bool(_MOVE.search(instruction))
         if regions:  # per-box instructions: one outline color per box, named in the prompt
             if len(regions) > len(MARK_PALETTE):
                 raise ValueError(f"at most {len(MARK_PALETTE)} regions per edit")
@@ -547,8 +549,7 @@ class EditSession:
             parts = [f"Inside the {MARK_PALETTE[i][0]} box: {text.strip().rstrip('.')}." for i, (_, text) in enumerate(regions)]
             colors = [MARK_PALETTE[i][1] for i in range(len(regions))]
             task = REGION_TEMPLATE.format(regions=" ".join(parts) + " ", instruction=instruction).replace("  ", " ")
-        move = bool(boxes) and len(boxes) == 2 and bool(_MOVE.search(instruction))
-        if move:
+        elif move:
             # "move X from the red box to the blue box": copy the red box's pixels into the blue box first,
             # so the moved thing is exactly the same; the model only erases the source and blends the target
             colors = [MARK_PALETTE[0][1], MARK_PALETTE[1][1]]
@@ -565,16 +566,15 @@ class EditSession:
                 colors = [c for _, c in used]
                 label = " and ".join(n for n, _ in used) if len(used) <= 2 else ", ".join(n for n, _ in used)
                 sentence = instruction.rstrip(" .") + "."
-                same = (" Anything moved or copied between the boxes keeps exactly its appearance: the same object, "
-                        "the same color, the same size and style." if len(used) > 1 else "")
-                task = (f"Edit only inside the {label} box{'es' if len(used) > 1 else ''}: {sentence}{same} "
+                task = (f"Edit only inside the {label} box{'es' if len(used) > 1 else ''}: {sentence} "
                         f"Remove all colored box outlines completely and keep everything outside the boxes unchanged.")
             else:
                 # one box, colors not referenced: never outline in a color the instruction names
                 free = [(n, c) for n, c in MARK_PALETTE if n not in instruction.lower()] or MARK_PALETTE
                 mark_name, mark_rgb = free[0]
                 colors = [mark_rgb] * len(boxes)
-                task = self.box_template.replace("red box", f"{mark_name} box").format(instruction=instruction)
+                task = self.box_template.replace("red box", f"{mark_name} box").format(
+                    instruction=instruction.rstrip(" .") + ".")
         else:
             task = instruction
         if raw_prompt:
