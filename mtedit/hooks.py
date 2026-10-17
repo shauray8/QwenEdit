@@ -59,6 +59,9 @@ def _predict_noise_impl(original, self, current_model, latent_model_input, times
         return original(self, current_model, latent_model_input, timestep, target_dtype, guidance, **kwargs)
     caches.prepared = True  # once per branch per request: the first step's call
     model = prefill.unwrap(current_model)
+    from mtedit import fp4
+
+    fp4.maybe_convert(model)  # MTEDIT_NVFP4=1: swap the DiT linears to NVFP4 once
     try:
         pending = _fill_from_pool(model, caches, kwargs)
     except Exception:

@@ -8,8 +8,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 def main():
     from mtedit.session import EditSession, Engine
     method = sys.argv[1]
-    e = Engine("Qwen/Qwen-Image-2.1-Turbo", out_dir=f"/workspace/mt/q/{method}", attention="sage_attn",
-               component_quantizations={"transformer": method})
+    quant = {} if method in ("nvfp4_mtedit", "bf16") else {"component_quantizations": {"transformer": method}}
+    e = Engine("Qwen/Qwen-Image-2.1-Turbo", out_dir=f"/workspace/mt/q/{method}", attention="sage_attn", **quant)
     for mp in (1.0, 4.0):
         s = EditSession(e, "/workspace/mt/photos/972a_cat.png", megapixels=mp, crop=False, session_id=f"m{mp}")
         s.edit("Make it warmer.", seed=1)

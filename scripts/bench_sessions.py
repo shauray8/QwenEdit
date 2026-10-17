@@ -27,6 +27,7 @@ def main():
     ap.add_argument("--out", default="/workspace/mt/bench")
     ap.add_argument("--model", default="Qwen/Qwen-Image-2.1-Turbo")
     ap.add_argument("--int8", action="store_true")
+    ap.add_argument("--progressive", type=int, default=0, help="unboxed edits: first N steps at half size")
     ap.add_argument("--bcg", action="store_true", help="SGLang breakable CUDA graphs for the DiT")
     ap.add_argument("--attention", default="sage_attn", help="DiT attention override (sage_attn, sage_attn_3, none)")
     ap.add_argument("--speed", default="quality", choices=["quality", "fast", "draft"])
@@ -54,6 +55,7 @@ def main():
     rows = []
     for name, (photo, steps) in SCENES.items():
         session = EditSession(engine, os.path.join(args.photos, photo), session_id=f"{name}_{args.tag}", sigmas=sigmas, megapixels=args.mp)
+        session.progressive = args.progressive
         w, h = session.size
         for index, (op, text, frac) in enumerate(steps):
             boxes = [(a * w, b * h, c * w, d * h) for a, b, c, d in frac] if frac else None
