@@ -60,14 +60,15 @@ _thumbs: dict[tuple, bytes] = {}
 _lock = threading.Lock()
 
 
-def _preview(session: EditSession, version: str, w: int = 1600) -> str:
-    """The version as a ~1600 px JPEG data URL, sent with the response so the canvas updates at once."""
+def _preview(session: EditSession, version: str, w: int = 1280) -> str:
+    """The version as a ~1280 px JPEG data URL (~120 KB), sent with the response so the canvas updates at
+    once; share tunnels are slow (~0.5 MB/s), so it stays small and the full PNG loads only on demand."""
     import base64
 
     image = session.image(version).convert("RGB")
     image.thumbnail((w, w))
     buf = io.BytesIO()
-    image.save(buf, "JPEG", quality=88)
+    image.save(buf, "JPEG", quality=82)
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
@@ -114,6 +115,30 @@ def _configure(session: EditSession, body: dict) -> None:
     session.ref_scale = 1.0 if cap is None else min(1.0, cap / mp)
     if "cumulative" in body:
         session.cumulative = bool(body["cumulative"])
+    # per-request step count for the model's own schedule (base model); Turbo presets set their own
+    session.steps = int(body["steps"]) if body.get("steps") else None
+
+
+def _objects(body: dict) -> dict:
+    """Box index -> object reference image, from each region's ``ref`` (a data URL or base64)."""
+    import base64
+
+    out = {}
+    for i, r in enumerate(body.get("regions") or []):
+        ref = r.get("ref")
+        if not ref:
+            continue
+        try:
+            image = Image.open(io.BytesIO(base64.b64decode(ref.split(",", 1)[-1])))
+            image.load()
+        except Exception:
+            raise HTTPException(400, f"box {i + 1}: the attached image could not be read")
+        if image.mode in ("RGBA", "LA", "P"):  # transparent product cut-outs go on white
+            rgba = image.convert("RGBA")
+            image = Image.new("RGB", rgba.size, (255, 255, 255))
+            image.paste(rgba, mask=rgba.split()[3])
+        out[i] = image.convert("RGB")
+    return out
 
 
 def _regions(body: dict):
@@ -129,11 +154,12 @@ def _regions(body: dict):
         raise HTTPException(400, f"at most {len(MARK_PALETTE)} boxes per edit")
     if not raw:
         return instruction, None, None
-    labeled = [bool((r.get("label") or "").strip()) for r in raw]
+    labeled = [bool((r.get("label") or "").strip()) or bool(r.get("ref")) for r in raw]
     boxes = [tuple(float(x) for x in r["box"]) for r in raw]
     if not any(labeled):  # unlabeled boxes + one instruction (e.g. "move the pawn from red to blue")
         return instruction, boxes, None
-    regions = [(b, (r.get("label") or "").strip() or instruction) for b, r in zip(boxes, raw)]
+    regions = [(b, (r.get("label") or "").strip() or ("place this item here" if r.get("ref") else instruction))
+               for b, r in zip(boxes, raw)]
     if any(not text for _, text in regions):
         raise HTTPException(400, "label each box, or write an instruction for the unlabeled ones")
     return (instruction if all(labeled) else ""), None, regions
@@ -184,6 +210,16 @@ def create_app() -> FastAPI:
             session = _new_session(pil, megapixels=RESOLUTIONS.get(resolution, 1.0))
         return _describe(session)
 
+    @app.get("/api/sessions/{session_id}/object/{vid}/{index}")
+    def object_image(session_id: str, vid: str, index: int):
+        version = _session(session_id).versions.get(vid)
+        path = (version.objects or {}).get(index) if version else None
+        if not path or not os.path.exists(path):
+            raise HTTPException(404, "no such object")
+        image = Image.open(path); image.thumbnail((256, 256))
+        buf = io.BytesIO(); image.convert("RGB").save(buf, "JPEG", quality=85)
+        return Response(buf.getvalue(), media_type="image/jpeg")
+
     @app.get("/api/sessions/{session_id}")
     def show(session_id: str):
         return _describe(_session(session_id))
@@ -192,6 +228,7 @@ def create_app() -> FastAPI:
     def edit(session_id: str, body: dict = Body(...)):
         session = _session(session_id)
         instruction, boxes, regions = _regions(body)
+        objects = _objects(body)
         raw_prompt = (body.get("raw_prompt") or "").strip() or None
         if not (instruction or boxes or regions or raw_prompt):
             raise HTTPException(400, "describe the edit, or draw and label boxes")
@@ -200,8 +237,8 @@ def create_app() -> FastAPI:
             _configure(session, body)
             version = session.edit(
                 instruction, boxes=boxes, regions=regions, raw_prompt=raw_prompt,
-                seed=None if seed in (None, "", -1) else int(seed), feather_px=float(body.get("feather", 16)),
-                from_version=body.get("from_version"),
+                seed=None if seed in (None, "", -1) else int(seed), feather_px=float(body.get("feather", 48)),
+                from_version=body.get("from_version"), objects=objects or None,
             )
         return {"version": version.id, **_describe(session, preview=True)}
 
@@ -280,6 +317,8 @@ def main():
     ap.add_argument("--enhancer-url", default=None, help="SGLang server running Qwen/Qwen-Image-2.1-PE-I2I")
     ap.add_argument("--resolver-url", default=None, help="SGLang server running a small instruct LLM for follow-ups")
     ap.add_argument("--no-graphs", action="store_true", help="disable breakable CUDA graphs for the DiT")
+    ap.add_argument("--steps", type=int, default=None, help="denoising steps (base model: e.g. 28; Turbo: leave unset)")
+    ap.add_argument("--guidance", type=float, default=None, help="true CFG scale (base model: e.g. 4.0; Turbo: unset)")
     args = ap.parse_args()
 
     import uvicorn
@@ -292,6 +331,7 @@ def main():
         _graphs = True
         extra.update(enable_breakable_cuda_graph=True, component_attention_backends={"transformer": "sage_attn"})
     _engine = Engine(args.model, out_dir=args.out, **extra)
+    _engine.default_steps, _engine.default_guidance = args.steps, args.guidance
     os.chdir(_engine.out_dir)  # never inside the code tree: syncs must not remove the working directory
     if args.enhancer_url:
         from mtedit.enhance import Enhancer

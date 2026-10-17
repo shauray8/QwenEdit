@@ -56,6 +56,10 @@ svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width:
 .tag input::placeholder { color: var(--dim); }
 .tag button { color: var(--dim); width: 18px; height: 18px; display: grid; place-items: center; border-radius: 4px; }
 .tag button:hover { color: var(--fg); background: var(--line-2); }
+.tag .thumb { width: 22px; height: 22px; border-radius: 4px; object-fit: cover; flex: none; border: 1px solid var(--line-2); }
+.box .obj { position: absolute; right: 4px; bottom: 4px; width: 30%; max-width: 72px; aspect-ratio: 1; object-fit: contain; border-radius: 6px;
+  background: rgba(255,255,255,.92); box-shadow: var(--shadow); pointer-events: none; }
+.box.dropping { outline: 2px dashed var(--accent); outline-offset: 3px; }
 .handle { position: absolute; width: 10px; height: 10px; right: -6px; bottom: -6px; background: #fff; border-radius: 3px; cursor: nwse-resize; }
 
 /* busy */
@@ -123,6 +127,8 @@ aside .head h3 { margin: 0 auto 0 0; font-size: 13px; }
 .kbd { font-size: 11px; color: var(--dim); border: 1px solid var(--line-2); border-radius: 4px; padding: 0 4px; margin-left: 6px; }
 .compare-flag { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); background: rgba(14,14,17,.85); border: 1px solid var(--line-2); border-radius: 999px; padding: 4px 10px; display: none; }
 .compare-flag.on { display: block; }
+.fetch-pill { position: absolute; top: 12px; right: 14px; background: rgba(14,14,17,.85); border: 1px solid var(--line-2); border-radius: 999px; padding: 4px 10px; font-variant-numeric: tabular-nums; color: var(--muted); display: none; }
+.fetch-pill.on { display: block; }
 @media (max-width: 900px) { .body { grid-template-columns: 48px 1fr; } aside { display: none; } .seg button small { display: none; } }
 </style>
 </head>
@@ -170,6 +176,7 @@ aside .head h3 { margin: 0 auto 0 0; font-size: 13px; }
         <div class="busy" id="busy"><span id="busyText"></span></div>
       </div>
       <div class="compare-flag" id="compareFlag">previous version</div>
+      <div class="fetch-pill" id="fetchPill"></div>
       <div class="dock" id="dock">
         <div class="enhanced" id="enhanced">
           <header>✨ Enhanced prompt <span style="flex:1"></span><button class="icon-btn" id="dropEnhanced" title="Discard"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></header>
@@ -202,7 +209,7 @@ aside .head h3 { margin: 0 auto 0 0; font-size: 13px; }
   <label>Crop boxed edits <input type="checkbox" id="optCrop" checked></label>
   <label>DiT attention <select id="optAttn"></select></label>
   <label>Progressive (2K) <input type="checkbox" id="optProg" checked></label>
-  <label>Edge feather <input type="range" id="optFeather" min="0" max="48" step="4" value="16"></label>
+  <label>Edge feather <input type="range" id="optFeather" min="0" max="96" step="8" value="48"></label>
   <label>Seed <input type="number" id="optSeed" placeholder="random"></label>
   <label>Follow-up context <input type="checkbox" id="optContext" checked></label>
   <label>Enhancer thinking <input type="checkbox" id="optThink"></label>
@@ -257,14 +264,28 @@ function renderBoxes() {
     el.style.width = `${(b.box[2] - b.box[0]) * S.scale}px`; el.style.height = `${(b.box[3] - b.box[1]) * S.scale}px`;
     const tag = document.createElement("div"); tag.className = "tag";
     const dot = document.createElement("span"); dot.className = "dot"; dot.style.background = rgb(c.rgb);
-    const input = document.createElement("input"); input.value = b.label; input.placeholder = "What goes here?";
+    const input = document.createElement("input"); input.value = b.label; input.placeholder = b.ref ? "Place / wear this item… (optional detail)" : "What goes here?";
     input.addEventListener("input", () => { b.label = input.value; updateChip(); });
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("prompt").focus(); } e.stopPropagation(); });
     input.addEventListener("pointerdown", (e) => e.stopPropagation());
     const del = document.createElement("button"); del.title = "Remove box"; del.innerHTML = '<svg viewBox="0 0 24 24" style="width:12px;height:12px"><path d="M6 6l12 12M18 6L6 18"/></svg>';
     del.addEventListener("pointerdown", (e) => e.stopPropagation());
     del.onclick = () => { S.boxes.splice(i, 1); S.sel = -1; renderBoxes(); updateChip(); };
-    tag.append(dot, input, del);
+    const attach = document.createElement("button"); attach.title = "Attach an item image (or drop / paste one onto the box)";
+    attach.innerHTML = '<svg viewBox="0 0 24 24" style="width:13px;height:13px"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M21 16l-5-5-8 8"/></svg>';
+    attach.addEventListener("pointerdown", (e) => e.stopPropagation());
+    attach.onclick = () => pickObject(i);
+    if (b.ref) {
+      const th = document.createElement("img"); th.className = "thumb"; th.src = b.ref; th.title = "Attached item (click to remove)";
+      th.addEventListener("pointerdown", (e) => e.stopPropagation());
+      th.onclick = () => { delete b.ref; renderBoxes(); };
+      const big = document.createElement("img"); big.className = "obj"; big.src = b.ref; el.append(big);
+      tag.append(dot, th, input, attach, del);
+    } else tag.append(dot, input, attach, del);
+    el.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); el.classList.add("dropping"); });
+    el.addEventListener("dragleave", () => el.classList.remove("dropping"));
+    el.addEventListener("drop", (e) => { e.preventDefault(); e.stopPropagation(); el.classList.remove("dropping");
+      const f = e.dataTransfer.files[0]; if (f) attachObject(i, f); });
     const handle = document.createElement("div"); handle.className = "handle";
     handle.addEventListener("pointerdown", (e) => { e.stopPropagation(); startDrag(e, i, "resize"); });
     el.addEventListener("pointerdown", (e) => { if (e.target === el) { e.stopPropagation(); S.sel = i; startDrag(e, i, "move"); } });
@@ -277,6 +298,37 @@ function updateChip() {
   const n = S.boxes.length;
   $("boxesChip").textContent = n ? `${n} box${n > 1 ? "es" : ""}` : "";
   $("prompt").placeholder = n ? "Optional: extra instruction, or what to do in unlabeled boxes…" : "Describe an edit to the whole image…";
+}
+// ---- item references on boxes: shrunk client-side (the tunnel is slow); the server places them at ~640 px
+function shrinkImage(file, max = 1024) {
+  return new Promise((resolve, reject) => {
+    const img = new Image(), url = URL.createObjectURL(file);
+    img.onload = () => {
+      const k = Math.min(1, max / Math.max(img.width, img.height)), c = document.createElement("canvas");
+      c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+      const g = c.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url); resolve({ data: c.toDataURL("image/jpeg", 0.92), w: img.width, h: img.height });
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("not an image")); };
+    img.src = url;
+  });
+}
+async function attachObject(i, file) {
+  if (!file || !file.type.startsWith("image/")) return toast("Drop an image file.");
+  const b = S.boxes[i]; if (!b) return;
+  b.ref = (await shrinkImage(file)).data; S.sel = i; renderBoxes();
+}
+function pickObject(i) {
+  const f = document.createElement("input"); f.type = "file"; f.accept = "image/*";
+  f.onchange = () => f.files[0] && attachObject(i, f.files[0]); f.click();
+}
+// dropping an item image on the canvas (not on a box) makes a box there, sized to the item's aspect
+async function dropObjectAt(e, file) {
+  if (S.boxes.length >= S.config.palette.length) return toast(`At most ${S.config.palette.length} boxes per edit.`);
+  const { data, w, h } = await shrinkImage(file), p = imagePoint(e), [W, H] = S.session.size;
+  const side = 0.28 * Math.min(W, H), bw = w >= h ? side : side * w / h, bh = w >= h ? side * h / w : side;
+  const x0 = Math.max(0, Math.min(W - bw, p[0] - bw / 2)), y0 = Math.max(0, Math.min(H - bh, p[1] - bh / 2));
+  S.boxes.push({ box: [x0, y0, x0 + bw, y0 + bh], label: "", ref: data, _focus: true }); S.sel = S.boxes.length - 1; renderBoxes();
 }
 function imagePoint(e) {
   const r = $("overlay").getBoundingClientRect(), [w, h] = S.session.size;
@@ -319,14 +371,15 @@ function show(data, { keepBoxes = false } = {}) {
   S.session = data;
   $("empty").hidden = true; $("frame").hidden = false; $("dock").classList.add("on");
   const head = data.versions[data.head];
-  // instant: the JPEG preview that came with the response; then the full PNG once it has loaded
-  const full = imageUrl(data.head);
-  $("img").src = data.preview || full;
-  if (data.preview) { const pre = new Image(); pre.onload = () => { if (S.session?.head === data.head && !S.compare) $("img").src = full; }; pre.src = full; }
+  // the preview that came with the response shows at once; the full-resolution PNG follows
+  S.previews = S.previews || {};
+  if (data.preview) S.previews[S.session.id+"/"+data.head] = data.preview;
+  $("img").src = S.previews[S.session.id+"/"+data.head] || imageUrl(data.head, 1280);
+  fetchFull(data.head);
   $("download").href = imageUrl(data.head); $("download").setAttribute("download", `${data.id}_${data.head}.png`);
   if (!keepBoxes) { S.boxes = []; S.sel = -1; }
   layout();
-  $("latency").innerHTML = head.seconds ? `<b>${head.seconds.toFixed(2)}s</b> ${head.timings?.crop ? "crop" : "full"}` : "";
+  showLatency();
   const list = $("versions"); list.replaceChildren();
   [...data.order].reverse().forEach((vid) => {
     const v = data.versions[vid], el = document.createElement("button");
@@ -346,6 +399,29 @@ function show(data, { keepBoxes = false } = {}) {
 }
 function prevOf(data, vid) { const i = data.order.indexOf(vid); return i > 0 ? data.order[i - 1] : null; }
 function imageUrl(vid, w) { return `/api/sessions/${S.session.id}/image/${vid}${w ? `?w=${w}` : ""}`; }
+function canvasUrl(vid) { return (S.full && S.full[S.session.id+"/"+vid]) || (S.previews && S.previews[S.session.id+"/"+vid]) || imageUrl(vid, 1280); }
+function fetchFull(vid) {
+  S.full = S.full || {};
+  if (S.full[S.session.id+"/"+vid]) { $("img").src = S.full[S.session.id+"/"+vid]; return; }
+  const t0 = performance.now(), url = imageUrl(vid), pill = $("fetchPill");
+  pill.classList.add("on");
+  clearInterval(S._fetchTimer);
+  const tick = () => pill.textContent = `Fetching full image · ${((performance.now() - t0) / 1000).toFixed(1)}s`;
+  tick(); S._fetchTimer = setInterval(tick, 100);
+  const img = new Image();
+  img.onload = () => {
+    S.full[S.session.id+"/"+vid] = url; clearInterval(S._fetchTimer); pill.classList.remove("on");
+    if (S.session?.head === vid && !S.compare) $("img").src = url;
+    if (S._t0 && S._lastVid === vid) { S.totalSec = (performance.now() - S._t0) / 1000; showLatency(); S._t0 = null; }
+  };
+  img.onerror = () => { clearInterval(S._fetchTimer); pill.classList.remove("on"); };
+  img.src = url;
+}
+function showLatency() {
+  const head = S.session?.versions[S.session.head];
+  if (!head || !head.seconds) { $("latency").innerHTML = ""; return; }
+  $("latency").innerHTML = `<b>${head.seconds.toFixed(2)}s</b> generate` + (S.totalSec ? ` · <b>${S.totalSec.toFixed(1)}s</b> total` : "");
+}
 
 async function run(fn, label = "Editing") {
   if (S.busy) return;
@@ -361,11 +437,13 @@ function common() {
 async function doEdit() {
   if (!S.session) return;
   const instruction = $("prompt").value.trim(), useEnhanced = $("enhanced").classList.contains("on");
-  const regions = S.boxes.map((b) => ({ box: b.box.map(Math.round), label: b.label.trim() }));
+  const regions = S.boxes.map((b) => ({ box: b.box.map(Math.round), label: b.label.trim(), ...(b.ref ? { ref: b.ref } : {}) }));
   if (!instruction && !regions.length && !useEnhanced) return toast("Describe an edit, or draw and label boxes.");
   const body = { instruction, regions, ...common() };
   if (useEnhanced) body.raw_prompt = $("enhancedText").value.trim();
-  const data = await run(() => api(`/api/sessions/${S.session.id}/edit`, body), "Editing");
+  S._t0 = performance.now(); S.totalSec = null;
+  const data = await run(() => api(`/api/sessions/${S.session.id}/edit`, body), "Generating");
+  if (data) S._lastVid = data.head;
   if (data) { $("prompt").value = ""; autosize(); $("enhanced").classList.remove("on"); }
 }
 async function doEnhance() {
@@ -403,7 +481,7 @@ function compare(on) {
   const head = S.session.versions[S.session.head];
   if (on && !head.parent) return;
   S.compare = on;
-  $("img").src = imageUrl(on ? head.parent : S.session.head);
+  $("img").src = canvasUrl(on ? head.parent : S.session.head);
   $("overlay").style.visibility = on ? "hidden" : "visible";
   $("compareFlag").classList.toggle("on", on); $("compareBtn").classList.toggle("on", on);
 }
@@ -415,7 +493,8 @@ $("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shi
 $("editBtn").onclick = doEdit;
 $("enhanceBtn").onclick = doEnhance;
 $("dropEnhanced").onclick = () => $("enhanced").classList.remove("on");
-$("rerollBtn").onclick = () => S.session && run(() => api(`/api/sessions/${S.session.id}/reroll`, common()), "Re-rolling");
+$("rerollBtn").onclick = () => { if (!S.session) return; S._t0 = performance.now(); S.totalSec = null;
+  run(() => api(`/api/sessions/${S.session.id}/reroll`, common()), "Generating").then((d) => { if (d) S._lastVid = d.head; }); };
 $("undoBtn").onclick = () => S.session && run(() => api(`/api/sessions/${S.session.id}/undo`, {}), null);
 $("clearBoxes").onclick = () => { S.boxes = []; S.sel = -1; renderBoxes(); };
 $("newBtn").onclick = () => { $("empty").hidden = false; $("frame").hidden = true; $("dock").classList.remove("on"); };
@@ -425,7 +504,17 @@ $("file").addEventListener("change", () => upload($("file").files[0]));
 $("drop").addEventListener("click", () => $("file").click());
 for (const ev of ["dragover", "dragenter"]) document.addEventListener(ev, (e) => { e.preventDefault(); $("drop").classList.add("over"); });
 document.addEventListener("dragleave", () => $("drop").classList.remove("over"));
-document.addEventListener("drop", (e) => { e.preventDefault(); $("drop").classList.remove("over"); upload(e.dataTransfer.files[0]); });
+document.addEventListener("drop", (e) => { e.preventDefault(); $("drop").classList.remove("over");
+  const f = e.dataTransfer.files[0];
+  if (f && S.session && !$("frame").hidden && $("frame").contains(e.target)) return dropObjectAt(e, f);
+  upload(f); });
+// paste an image: onto the selected box as its item, else (no session) as a new image
+document.addEventListener("paste", (e) => {
+  const item = [...(e.clipboardData?.items || [])].find((it) => it.type.startsWith("image/"));
+  if (!item) return;
+  e.preventDefault();
+  if (S.session && S.sel >= 0) attachObject(S.sel, item.getAsFile()); else if (!S.session) upload(item.getAsFile());
+});
 $("compareBtn").addEventListener("pointerdown", () => compare(true));
 for (const ev of ["pointerup", "pointerleave"]) $("compareBtn").addEventListener(ev, () => S.compare && compare(false));
 $("settingsBtn").onclick = (e) => { e.stopPropagation(); $("settings").classList.toggle("on"); };

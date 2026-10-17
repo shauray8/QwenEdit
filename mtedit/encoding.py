@@ -85,11 +85,12 @@ def encoding_forward(self, batch, server_args):
     resized, shapes, conditions = [], [], []
     area = batch.height * batch.width * (mt.ref_scale if mt.mask is None else 1.0)  # mt: smaller references
     image_mode = "RGBA" if ac.in_channels == 4 else "RGB"
-    for image in images:
+    for index, image in enumerate(images):
         if not isinstance(image, Image.Image):
             image = load_image(image, convert_method=lambda image: image.convert(image_mode))
-        width = max(32, round(math.sqrt(area * image.width / image.height) / 32) * 32)
-        height = max(32, round(math.sqrt(area * image.height / image.width) / 32) * 32)
+        ref_area = batch.height * batch.width * mt.ref_scales[index] if index in mt.ref_scales else area
+        width = max(32, round(math.sqrt(ref_area * image.width / image.height) / 32) * 32)
+        height = max(32, round(math.sqrt(ref_area * image.height / image.width) / 32) * 32)
         resized.append(image.convert(image_mode).resize((width, height), Image.Resampling.LANCZOS))
         shapes.append((1, height // 16, width // 16))
 
@@ -286,16 +287,26 @@ def _vae_encode(self, config, ac, device, items, conditions):
 
 
 def annotate(image, spec):
-    """The canvas with each box outlined (inside the box, so the outline is regenerated)."""
+    """The canvas with each box outlined just OUTSIDE the box, past the mask's outward feather.
+
+    Outside the editable region the latents are reset to the clean source every step, so the outline
+    is erased for free there; drawn inside, the model had to paint it out and often left a tint of the
+    outline's complementary color (green after red, streaks) inside the box.
+    """
     from PIL import ImageDraw
 
     out = image.copy()
     draw = ImageDraw.Draw(out)
     width = max(1, int(round(spec.mark_width_px)))
+    gap = int(spec.feather_px + spec.grow_px) + 8  # clear of the feathered edge (and its latent cells)
+    W, H = out.size
     alpha = (255,) if out.mode == "RGBA" else ()
     colors = spec.colors or [spec.mark_color] * len(spec.boxes)
     for (x0, y0, x1, y1), rgb in zip(spec.boxes, colors):
-        draw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=tuple(rgb) + alpha, width=width)
+        # on an image border there is no outside: the outline sits at the border, inside the image
+        ox0, oy0 = max(0, int(x0) - gap - width), max(0, int(y0) - gap - width)
+        ox1, oy1 = min(W - 1, int(x1) - 1 + gap + width), min(H - 1, int(y1) - 1 + gap + width)
+        draw.rectangle((ox0, oy0, ox1, oy1), outline=tuple(rgb) + alpha, width=width)
     return out
 
 
