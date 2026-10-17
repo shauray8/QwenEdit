@@ -27,12 +27,20 @@ def main():
     ap.add_argument("--out", default="/workspace/mt/bench")
     ap.add_argument("--model", default="Qwen/Qwen-Image-2.1-Turbo")
     ap.add_argument("--int8", action="store_true")
+    ap.add_argument("--bcg", action="store_true", help="SGLang breakable CUDA graphs for the DiT")
+    ap.add_argument("--attention", default="sage_attn", help="DiT attention override (sage_attn, sage_attn_3, none)")
+    ap.add_argument("--speed", default="quality", choices=["quality", "fast", "draft"])
     args = ap.parse_args()
 
     from mtedit.session import EditSession, Engine
 
+    from mtedit.session import SPEED_PRESETS
+
     extra = {"component_quantizations": {"transformer": "convrot_int8"}} if args.int8 else {}
-    engine = Engine(args.model, out_dir=args.out, **extra)
+    if args.bcg:
+        extra["enable_breakable_cuda_graph"] = True
+    engine = Engine(args.model, out_dir=args.out, attention=None if args.attention == "none" else args.attention, **extra)
+    sigmas = SPEED_PRESETS[args.speed]
     # warm kernels, allocator and pools on a throwaway session
     warm = EditSession(engine, os.path.join(args.photos, "972a_cat.png"), session_id="warm")
     warm.edit("Make the image slightly warmer.", seed=1)
@@ -40,7 +48,7 @@ def main():
 
     rows = []
     for name, (photo, steps) in SCENES.items():
-        session = EditSession(engine, os.path.join(args.photos, photo), session_id=f"{name}_{args.tag}")
+        session = EditSession(engine, os.path.join(args.photos, photo), session_id=f"{name}_{args.tag}", sigmas=sigmas)
         w, h = session.size
         for index, (op, text, frac) in enumerate(steps):
             boxes = [(a * w, b * h, c * w, d * h) for a, b, c, d in frac] if frac else None

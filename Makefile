@@ -51,3 +51,7 @@ check general bench: sync
 pull:
 	mkdir -p pod_out
 	echo 'cd /workspace/mt && tar czf - --exclude="*.safetensors" check* general* crop steps attn bench* logs editor 2>/dev/null | base64 -w 76' | $(RP) | grep -E '^[A-Za-z0-9+/=]+$$' | base64 -d | tar xzf - -C pod_out && du -sh pod_out
+
+# speed experiments: fresh process per config
+speed: sync
+	echo 'source $(POD)/env.sh; cd /workspace/multi_turn/scripts && python bench_attn.py 2>&1 | grep -v Warning; for cfg in "base:" "bcg:--bcg"; do t=$${cfg%%:*}; f=$${cfg#*:}; python bench_sessions.py --tag $$t --int8 $$f > /workspace/mt/logs/speed_$$t.log 2>&1; tail -n1 /workspace/mt/logs/speed_$$t.log; done' | $(RP)
