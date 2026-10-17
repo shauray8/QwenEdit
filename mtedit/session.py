@@ -198,6 +198,62 @@ def change_mask(new: Image.Image, old: Image.Image, threshold: float = 14.0, dil
     return mask, box
 
 
+def blend_box_edit(out: Image.Image, source: Image.Image, boxes, feather_px: float, grow_px: float,
+                   band_px: int = 12, keep_lo: float = 6.0, keep_hi: float = 22.0) -> Image.Image:
+    """Paste a boxed edit back so it matches its surroundings.
+
+    1. tone-match: per channel, map the generated box's colors so that a thin band just
+       inside the box edge (where nothing should change) matches the original there;
+    2. keep only real changes: inside the box, pixels the model merely re-rendered
+       (small difference to the original) revert to the original; only the new or
+       changed content is pasted, with a soft edge.
+    """
+    import numpy as np
+    from PIL import ImageFilter
+
+    # do all the work inside the boxes' padded union: outside it the result is the source
+    pad = int(feather_px + grow_px + 16)
+    W, H = out.size
+    ux0 = max(0, int(min(b[0] for b in boxes)) - pad); uy0 = max(0, int(min(b[1] for b in boxes)) - pad)
+    ux1 = min(W, int(max(b[2] for b in boxes)) + pad); uy1 = min(H, int(max(b[3] for b in boxes)) + pad)
+    if (ux0, uy0, ux1, uy1) != (0, 0, W, H):
+        local = [(b[0] - ux0, b[1] - uy0, b[2] - ux0, b[3] - uy0) for b in boxes]
+        patch = blend_box_edit(out.crop((ux0, uy0, ux1, uy1)), source.crop((ux0, uy0, ux1, uy1)), local,
+                               feather_px, grow_px, band_px, keep_lo, keep_hi)
+        full = source.copy()
+        full.paste(patch, (ux0, uy0))
+        return full
+
+    o = np.asarray(out.convert("RGB"), np.float32)
+    src = np.asarray(source.convert("RGB"), np.float32)
+    h, w = o.shape[:2]
+    result = o.copy()
+    for x0, y0, x1, y1 in boxes:
+        x0, y0 = max(0, int(x0)), max(0, int(y0))
+        x1, y1 = min(w, int(x1)), min(h, int(y1))
+        if x1 - x0 < 4 * band_px or y1 - y0 < 4 * band_px:
+            continue
+        region = (slice(y0, y1), slice(x0, x1))
+        ring = np.ones((y1 - y0, x1 - x0), bool)
+        ring[band_px:-band_px, band_px:-band_px] = False
+        go, gs = o[region][ring], src[region][ring]
+        mo, ms = go.mean(0), gs.mean(0)
+        so, ss = go.std(0) + 1e-3, gs.std(0) + 1e-3
+        scale = np.clip(ss / so, 0.8, 1.25)  # correct tone, never invent contrast
+        result[region] = np.clip((o[region] - mo) * scale + ms, 0, 255)
+    # where the result barely differs from the original, keep the original
+    diff = np.abs(result - src).mean(-1)
+    diff = np.asarray(Image.fromarray(np.clip(diff, 0, 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(3)), np.float32)
+    changed = np.clip((diff - keep_lo) / (keep_hi - keep_lo), 0, 1)
+    changed = np.asarray(Image.fromarray((changed * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(9))
+                         .filter(ImageFilter.GaussianBlur(4)), np.float32) / 255
+    box = np.asarray(pixel_mask(out.size, boxes, feather_px, grow_px), np.float32) / 255
+    m = (box * changed)[..., None]
+    blended = (result * m + src * (1 - m)).astype(np.uint8)
+    final = Image.fromarray(blended)
+    return final.convert(source.mode) if source.mode != "RGB" else final
+
+
 def pixel_mask(size: tuple[int, int], boxes: list[Box], feather_px: float, grow_px: float) -> Image.Image:
     """Feathered editable mask in pixels (255 = take the new image)."""
     mask = Image.new("L", size, 0)
@@ -506,7 +562,7 @@ class EditSession:
             generated = time.perf_counter()
             out = out.convert(source.mode)
             if boxes and self.paste_back:
-                out = Image.composite(out, source, pixel_mask(out.size, boxes, feather_px, grow_px))
+                out = blend_box_edit(out, source, boxes, feather_px, grow_px)
             # unboxed edits are kept whole: soft effects (glow, shadows, reflections) do not survive
             # a hard change mask; the change box is still measured below for scene memory
         else:
@@ -568,7 +624,7 @@ class EditSession:
             attention=attention,
         )
         out = out.convert(source.mode)
-        patch = Image.composite(out, crop_image, pixel_mask(out.size, local, feather_px, grow_px)) if self.paste_back else out
+        patch = blend_box_edit(out, crop_image, local, feather_px, grow_px) if self.paste_back else out
         full = source.copy()
         full.paste(patch, (x0, y0))
         return full, result, latent_id
