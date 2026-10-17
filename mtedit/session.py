@@ -424,7 +424,8 @@ class EditSession:
                 and not raw_prompt):
             lineage = self.lineage(parent.id)
             anchor_index = max(i for i, v in enumerate(lineage) if v.parent is None or v.boxes or v.regions)
-            since = [v.request for v in lineage[anchor_index + 1:] if v.request]
+            # resolved instructions ("Make the red coffee mug blue."), not raw ones ("make it blue")
+            since = [v.instruction or v.request for v in lineage[anchor_index + 1:] if (v.instruction or v.request)]
             if since:
                 try:
                     merged = self.resolver.merge(since + [request])
@@ -447,12 +448,7 @@ class EditSession:
                 resolved = {"error": str(err)}
             if "instruction" in resolved:
                 instruction = resolved["instruction"]
-                target = resolved.get("target")
-                if not boxes and target:  # "make it red": edit where the referenced object was made
-                    ref = lineage[target - 1]
-                    boxes = ref.boxes or ([tuple(b) for b, _ in ref.regions] if ref.regions else None)
-                    # an unboxed earlier edit: no box; the model finds "the sun" itself (pixel-diff
-                    # guesses pick the wrong blob, e.g. the sun's reflection)
+                # no silent box reuse: an edit without a drawn box has no box (and no box wording)
                 sdedit = self.sdedit_modify and resolved.get("mode") == "modify" and bool(boxes)
         colors = None
         if regions:  # per-box instructions: one outline color per box, named in the prompt
