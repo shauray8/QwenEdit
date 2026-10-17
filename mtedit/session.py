@@ -73,6 +73,7 @@ class Version:
     change_box: Box | None = None  # where this edit actually changed the image (scene memory)
     request: str | None = None  # what the user typed
     base: str | None = None  # the version the model actually edited (the anchor for text edits)
+    standalone: bool = False  # a typed edit that is not a follow-up: later follow-ups do not redo it
     children: list[str] = field(default_factory=list)
 
 
@@ -479,14 +480,17 @@ class EditSession:
         merged = None
         if (self.cumulative and self.resolver is not None and request and not boxes and not regions
                 and not raw_prompt):
-            lineage = self.lineage(parent.id)
-            anchor_index = max(i for i, v in enumerate(lineage) if v.parent is None or v.boxes or v.regions)
-            # resolved instructions ("Make the red coffee mug blue."), not raw ones ("make it blue")
-            since = [v.instruction or v.request for v in lineage[anchor_index + 1:] if (v.instruction or v.request)]
-            if since:
+            # a follow-up of the LAST typed edit ("make them blue" after "give him red sneakers") redoes
+            # only that edit, from its own base, with both merged; anything else edits the current image,
+            # so earlier edits you liked are never redone
+            last = parent
+            if last.parent is not None and last.request and not last.boxes and not last.regions:
                 try:
-                    merged = self.resolver.merge(since + [request])
-                    base = lineage[anchor_index]
+                    probe = self.resolver.resolve([(1, last.instruction or last.request)], request)
+                    if probe.get("target") == 1:
+                        merged = self.resolver.merge([last.request if last.base == last.parent else
+                                                      (last.instruction or last.request), request])
+                        base = self.versions[last.base or last.parent]
                 except Exception as err:
                     merged = {"error": str(err)}
         refs = self._refs(base)
@@ -589,6 +593,7 @@ class EditSession:
             boxes=boxes, feather_px=feather_px, grow_px=grow_px, seed=seed,
             latent_id=latent_id, seconds=seconds, timings=timings, prompt=prompt, resolved=resolved,
             change_box=change_box, request=request or None, base=base.id,
+            standalone=bool(request) and not boxes and not regions and merged is None,
         )
         self.versions[vid] = version
         parent.children.append(vid)
