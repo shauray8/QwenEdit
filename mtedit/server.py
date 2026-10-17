@@ -131,7 +131,7 @@ def _regions(body: dict):
         return instruction, None, None
     labeled = [bool((r.get("label") or "").strip()) for r in raw]
     boxes = [tuple(float(x) for x in r["box"]) for r in raw]
-    if len(raw) == 1 and not labeled[0]:
+    if not any(labeled):  # unlabeled boxes + one instruction (e.g. "move the pawn from red to blue")
         return instruction, boxes, None
     regions = [(b, (r.get("label") or "").strip() or instruction) for b, r in zip(boxes, raw)]
     if any(not text for _, text in regions):

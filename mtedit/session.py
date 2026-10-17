@@ -166,6 +166,18 @@ def _may_refer(request: str) -> bool:
     return len(request.split()) <= 4 or bool(_REFERRING.search(request))
 
 
+_MOVE = re.compile(r"\b(move|moves|moving|drag|shift|relocate|put .* (in|into|to) the blue)\b", re.I)
+
+
+def _move_composite(image: Image.Image, boxes) -> Image.Image:
+    """Copy the first box's pixels into the second box (resized to fit)."""
+    (sx0, sy0, sx1, sy1), (dx0, dy0, dx1, dy1) = [tuple(int(round(v)) for v in b) for b in boxes]
+    patch = image.crop((sx0, sy0, sx1, sy1)).resize((max(1, dx1 - dx0), max(1, dy1 - dy0)), Image.Resampling.LANCZOS)
+    out = image.copy()
+    out.paste(patch, (dx0, dy0))
+    return out
+
+
 def _pad_box(box, pad, size):
     x0, y0, x1, y1 = box
     return (max(0, x0 - pad), max(0, y0 - pad), min(size[0], x1 + pad), min(size[1], y1 + pad))
@@ -212,7 +224,7 @@ def change_mask(new: Image.Image, old: Image.Image, threshold: float = 14.0, dil
 
 
 def blend_box_edit(out: Image.Image, source: Image.Image, boxes, feather_px: float, grow_px: float,
-                   band_px: int = 12, keep_lo: float = 6.0, keep_hi: float = 22.0) -> Image.Image:
+                   band_px: int = 12, keep_lo: float = 2.0, keep_hi: float = 6.0) -> Image.Image:
     """Paste a boxed edit back so it matches its surroundings.
 
     1. tone-match: per channel, map the generated box's colors so that a thin band just
@@ -258,8 +270,10 @@ def blend_box_edit(out: Image.Image, source: Image.Image, boxes, feather_px: flo
     diff = np.abs(result - src).mean(-1)
     diff = np.asarray(Image.fromarray(np.clip(diff, 0, 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(3)), np.float32)
     changed = np.clip((diff - keep_lo) / (keep_hi - keep_lo), 0, 1)
-    changed = np.asarray(Image.fromarray((changed * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(9))
-                         .filter(ImageFilter.GaussianBlur(4)), np.float32) / 255
+    # wide dilation, then a soft edge: subtle-but-intended changes (a cream piece erased from a cream
+    # square) must be fully kept, never half-restored as a ghost
+    changed = np.asarray(Image.fromarray((changed * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(15))
+                         .filter(ImageFilter.GaussianBlur(3)), np.float32) / 255
     box = np.asarray(pixel_mask(out.size, boxes, feather_px, grow_px), np.float32) / 255
     m = (box * changed)[..., None]
     blended = (result * m + src * (1 - m)).astype(np.uint8)
@@ -513,7 +527,8 @@ class EditSession:
         resolved, sdedit = None, False
         if merged and "instruction" in merged:
             instruction, resolved = merged["instruction"], {"mode": "merged", "base": base.id, **merged}
-        elif self.resolver is not None and instruction and not regions and not raw_prompt:
+        elif (self.resolver is not None and instruction and not regions and not raw_prompt and not boxes
+              and _may_refer(instruction)):  # boxes already say what the edit is about: never rewrite them
             lineage = [v for v in self.lineage(parent.id) if v.parent is not None]
             history = [(i + 1, v.instruction or "; ".join(t for _, t in (v.regions or []))) for i, v in enumerate(lineage)]
             try:
@@ -532,12 +547,34 @@ class EditSession:
             parts = [f"Inside the {MARK_PALETTE[i][0]} box: {text.strip().rstrip('.')}." for i, (_, text) in enumerate(regions)]
             colors = [MARK_PALETTE[i][1] for i in range(len(regions))]
             task = REGION_TEMPLATE.format(regions=" ".join(parts) + " ", instruction=instruction).replace("  ", " ")
+        move = bool(boxes) and len(boxes) == 2 and bool(_MOVE.search(instruction))
+        if move:
+            # "move X from the red box to the blue box": copy the red box's pixels into the blue box first,
+            # so the moved thing is exactly the same; the model only erases the source and blends the target
+            colors = [MARK_PALETTE[0][1], MARK_PALETTE[1][1]]
+            task = ("Inside the red box, remove the object completely and show only the empty background that "
+                    "belongs there, continuing the surrounding pattern and colors. Inside the blue box, keep the "
+                    "object exactly as it is (same object, color, size and style) and only blend its edges "
+                    "naturally into the surroundings. Remove all colored box outlines completely and keep "
+                    "everything outside the boxes unchanged.")
         elif boxes and self.mark_boxes:
-            # never outline in a color the instruction names ("make it red" gets a blue box)
-            free = [(n, c) for n, c in MARK_PALETTE if n not in instruction.lower()] or MARK_PALETTE
-            mark_name, mark_rgb = free[0]
-            colors = [mark_rgb] * len(boxes)
-            task = self.box_template.replace("red box", f"{mark_name} box").format(instruction=instruction)
+            names = [n for n, _ in MARK_PALETTE]
+            if len(boxes) > 1 or re.search(r"\b(" + "|".join(names) + r")\s+(box|square|area|region)", instruction, re.I):
+                # boxes keep the editor's colors (red, blue, ...), because the user refers to them by color
+                used = MARK_PALETTE[: len(boxes)]
+                colors = [c for _, c in used]
+                label = " and ".join(n for n, _ in used) if len(used) <= 2 else ", ".join(n for n, _ in used)
+                sentence = instruction.rstrip(" .") + "."
+                same = (" Anything moved or copied between the boxes keeps exactly its appearance: the same object, "
+                        "the same color, the same size and style." if len(used) > 1 else "")
+                task = (f"Edit only inside the {label} box{'es' if len(used) > 1 else ''}: {sentence}{same} "
+                        f"Remove all colored box outlines completely and keep everything outside the boxes unchanged.")
+            else:
+                # one box, colors not referenced: never outline in a color the instruction names
+                free = [(n, c) for n, c in MARK_PALETTE if n not in instruction.lower()] or MARK_PALETTE
+                mark_name, mark_rgb = free[0]
+                colors = [mark_rgb] * len(boxes)
+                task = self.box_template.replace("red box", f"{mark_name} box").format(instruction=instruction)
         else:
             task = instruction
         if raw_prompt:
@@ -570,12 +607,17 @@ class EditSession:
                 mt["mask"]["colors"] = [list(c) for c in colors]
         seed = int(time.time_ns() % (2**31)) if seed is None else seed
         source = self._image_cache.get(base.id) or Image.open(self.path(base.id))
+        canvas = _move_composite(source, boxes) if move else source  # what the model sees (pre-blend)
         window = self.crop_rect(boxes) if boxes and self.crop else None
 
         start = time.perf_counter()
         if window is None:
+            images = [self._file(r.id) for r in refs]
+            if move:  # the model sees the composite as its canvas
+                images[-1] = os.path.join(self.dir, f"{vid}_move.png")
+                canvas.save(images[-1], compress_level=1)
             out, result = self.engine.run(
-                prompt=prompt, images=[self._file(r.id) for r in refs], width=self.size[0], height=self.size[1],
+                prompt=prompt, images=images, width=self.size[0], height=self.size[1],
                 seed=seed, mt=mt, name=f"session_{self.id}_{vid}_raw", steps=self.steps,
                 guidance_scale=self.guidance_scale, attention=attention,
             )
@@ -588,7 +630,7 @@ class EditSession:
         else:
             out, result, latent_id = self._crop_edit(
                 parent, source, window, task, boxes, colors, regions, seed, feather_px, grow_px, vid, latent_id,
-                sigmas, attention, sdedit,
+                sigmas, attention, sdedit, canvas=canvas,
             )
             generated = time.perf_counter()
         posted = time.perf_counter()
@@ -617,14 +659,14 @@ class EditSession:
         return version
 
     def _crop_edit(self, parent, source, window, task, boxes, colors, regions, seed, feather_px, grow_px, vid, latent_id,
-                   sigmas=None, attention=None, sdedit=False):
+                   sigmas=None, attention=None, sdedit=False, canvas=None):
         """Generate only ``window`` and paste it back; returns (full image, result, latent id or None)."""
         x0, y0, x1, y1 = window
         cells = [x0 // 16, y0 // 16, x1 // 16, y1 // 16]
         local = [(bx0 - x0, by0 - y0, bx1 - x0, by1 - y0) for bx0, by0, bx1, by1 in boxes]
         crop_image = source.crop(window)
         crop_path = os.path.join(self.dir, f"{vid}_in.png")
-        crop_image.save(crop_path, compress_level=1)
+        (canvas or source).crop(window).save(crop_path, compress_level=1)  # the model's canvas (a move composite)
         mt: dict = {
             "prefix_cache": self.cache,
             **({"sigmas": list(sigmas)} if sigmas else {}),
