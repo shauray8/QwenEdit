@@ -72,8 +72,17 @@ svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width:
   border-radius: 999px; padding: 5px 12px; font-variant-numeric: tabular-nums; }
 
 /* empty state */
-.empty { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px; }
-.start { width: min(620px, 100%); background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 18px; box-shadow: var(--shadow); }
+.empty { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); width: min(640px, calc(100% - 32px)); z-index: 15; }
+.empty:not(.dim) { top: 50%; transform: translate(-50%, -50%); }
+.start { width: 100%; background: rgba(22,22,27,.62); backdrop-filter: blur(14px) saturate(1.2); -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  border: 1px solid var(--line-2); border-radius: 16px; padding: 14px; box-shadow: var(--shadow); transition: opacity .15s; }
+.empty.dim .start { opacity: .5; }
+.empty.dim .start:hover, .empty.dim .start:focus-within { opacity: 1; }
+.empty.dim .start p, .empty.dim .start h2 { display: none; }
+.empty.dim textarea { min-height: 44px; }
+.start.working { opacity: .5 !important; pointer-events: none; }
+.aspects button { display: inline-flex; align-items: center; gap: 6px; }
+.aspects svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.6; }
 .start h2 { margin: 0 0 4px; font-size: 18px; }
 .start p { margin: 0 0 14px; color: var(--muted); }
 .start textarea { width: 100%; min-height: 84px; resize: vertical; background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; outline: 0; }
@@ -85,7 +94,8 @@ svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width:
 .primary:hover:not(:disabled) { background: var(--accent-2); }
 .ghost { padding: 8px 12px; border-radius: 10px; border: 1px solid var(--line-2); color: var(--fg); }
 .ghost:hover:not(:disabled) { background: var(--panel-2); }
-.drop { margin-top: 12px; border: 1px dashed var(--line-2); border-radius: 10px; padding: 16px; text-align: center; color: var(--muted); }
+.drop { padding: 5px 10px; border: 1px dashed var(--line-2); border-radius: 8px; color: var(--muted); cursor: pointer; display: inline-flex; gap: 6px; align-items: center; }
+.drop svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.8; }
 .drop.over { border-color: var(--accent); color: var(--fg); }
 
 /* prompt dock */
@@ -164,10 +174,10 @@ aside .head h3 { margin: 0 auto 0 0; font-size: 13px; }
           <textarea id="genPrompt" placeholder="A sunlit reading nook with a green velvet armchair, photorealistic"></textarea>
           <div class="row" style="margin-top:10px">
             <div class="row aspects" id="aspects"></div>
+            <label class="drop" id="drop" title="Upload or drop an image"><svg viewBox="0 0 24 24"><path d="M12 16V5M7 10l5-5 5 5M5 19h14"/></svg>Upload<input type="file" id="file" accept="image/*" hidden></label>
             <span style="flex:1"></span>
             <button class="primary" id="genBtn">Generate</button>
           </div>
-          <label class="drop" id="drop">Drop an image here, or <u>browse</u><input type="file" id="file" accept="image/*" hidden></label>
         </div>
       </div>
       <div class="frame" id="frame" hidden>
@@ -369,7 +379,7 @@ function summary(v) {
 }
 function show(data, { keepBoxes = false } = {}) {
   S.session = data;
-  $("empty").hidden = true; $("frame").hidden = false; $("dock").classList.add("on");
+  $("empty").classList.add("dim"); $("frame").hidden = false; $("dock").classList.add("on");
   const head = data.versions[data.head];
   // the preview that came with the response shows at once; the full-resolution PNG follows
   S.previews = S.previews || {};
@@ -461,18 +471,17 @@ async function doEnhance() {
 async function generate() {
   const prompt = $("genPrompt").value.trim(); if (!prompt) return toast("Write a prompt to generate an image.");
   const seed = $("optSeed").value;
-  $("frame").hidden = true;
   busy(true, "Generating");
-  $("empty").querySelector(".start").style.opacity = .5;
+  $("empty").querySelector(".start").classList.add("working");
   try { show(await api("/api/generate", { prompt, aspect: S.aspect, resolution: $("optRes").value, seed: seed === "" ? null : +seed })); }
-  catch (err) { toast(err.message); } finally { busy(false); $("empty").querySelector(".start").style.opacity = 1; }
+  catch (err) { toast(err.message); } finally { busy(false); $("empty").querySelector(".start").classList.remove("working"); }
 }
 async function upload(file) {
   if (!file) return;
   const form = new FormData(); form.append("image", file);
-  $("empty").querySelector(".start").style.opacity = .5;
+  $("empty").querySelector(".start").classList.add("working");
   try { show(await api(`/api/sessions?resolution=${$("optRes").value}`, form)); } catch (err) { toast(err.message); }
-  finally { $("empty").querySelector(".start").style.opacity = 1; }
+  finally { $("empty").querySelector(".start").classList.remove("working"); }
 }
 
 // ---- compare (hold)
@@ -497,11 +506,10 @@ $("rerollBtn").onclick = () => { if (!S.session) return; S._t0 = performance.now
   run(() => api(`/api/sessions/${S.session.id}/reroll`, common()), "Generating").then((d) => { if (d) S._lastVid = d.head; }); };
 $("undoBtn").onclick = () => S.session && run(() => api(`/api/sessions/${S.session.id}/undo`, {}), null);
 $("clearBoxes").onclick = () => { S.boxes = []; S.sel = -1; renderBoxes(); };
-$("newBtn").onclick = () => { $("empty").hidden = false; $("frame").hidden = true; $("dock").classList.remove("on"); };
+$("newBtn").onclick = () => { $("genPrompt").focus(); $("genPrompt").select(); };
 $("genBtn").onclick = generate;
 $("genPrompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) generate(); });
 $("file").addEventListener("change", () => upload($("file").files[0]));
-$("drop").addEventListener("click", () => $("file").click());
 for (const ev of ["dragover", "dragenter"]) document.addEventListener(ev, (e) => { e.preventDefault(); $("drop").classList.add("over"); });
 document.addEventListener("dragleave", () => $("drop").classList.remove("over"));
 document.addEventListener("drop", (e) => { e.preventDefault(); $("drop").classList.remove("over");
@@ -543,7 +551,9 @@ document.addEventListener("keyup", (e) => { if (e.key === " " && S.compare) comp
   if (!S.config.enhancer) $("enhanceBtn").title = "Start the server with --enhancer-url to enable";
   const asp = $("aspects");
   for (const a of Object.keys(S.config.aspects)) {
-    const b = document.createElement("button"); b.textContent = a; if (a === S.aspect) b.className = "on";
+    const b = document.createElement("button"); if (a === S.aspect) b.className = "on";
+    const [rw, rh] = a.split(":").map(Number), k = 14 / Math.max(rw, rh), w = rw * k, h = rh * k;
+    b.innerHTML = `<svg viewBox="0 0 16 16"><rect x="${(16 - w) / 2}" y="${(16 - h) / 2}" width="${w}" height="${h}" rx="1.5"/></svg>${a}`;
     b.onclick = () => { S.aspect = a; asp.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b)); };
     asp.append(b);
   }

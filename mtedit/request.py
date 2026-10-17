@@ -34,6 +34,10 @@ class MaskSpec:
     # modify edits: start the whole latent from the source noised to the schedule's first sigma
     # (SDEdit) instead of pure noise, so geometry inside the box stays aligned with the outside
     init_from_source: bool = False
+    # change lock: at the first step whose next sigma is <= this, cells inside the box whose predicted
+    # clean latent matches the source (within the model's own re-render error, measured outside the box)
+    # are frozen to the source for the remaining steps; 0 disables
+    lock_sigma: float = 0.75
 
 
 @dataclass
@@ -78,6 +82,7 @@ class MTRequest:
                 mark_width_px=float(mask.get("mark_width_px", 6.0)),
                 colors=[tuple(int(c) for c in rgb) for rgb in mask["colors"]] if mask.get("colors") else None,
                 init_from_source=bool(mask.get("init_from_source", False)),
+                lock_sigma=float(mask.get("lock_sigma", 0.75)),
             )
             if mask
             else None,

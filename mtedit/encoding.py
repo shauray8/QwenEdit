@@ -32,7 +32,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages i
 from sglang.multimodal_gen.runtime.utils.vision import load_image
 
 from mtedit import keys, state
-from mtedit.masking import MaskState, rasterize
+from mtedit.masking import MaskState, rasterize, rasterize_inside
 from mtedit.request import MTRequest
 
 logger = logging.getLogger(__name__)
@@ -326,4 +326,7 @@ def _prepare_mask(batch, mt, conditions, shapes, clean=None):
         x0=source[:1],
         editable=editable.view(1, -1, 1).to(source.device),
         init_from_source=spec.init_from_source,
+        inside=rasterize_inside(spec, batch.height, batch.width).view(1, -1, 1).to(source.device),
+        hw=(batch.height // 16, batch.width // 16),
+        lock_sigma=spec.lock_sigma,
     )

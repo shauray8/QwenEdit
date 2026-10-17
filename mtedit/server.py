@@ -41,7 +41,7 @@ ASPECTS = {
     "1:1": (1024, 1024), "4:3": (1184, 896), "3:4": (896, 1184), "3:2": (1248, 832),
     "2:3": (832, 1248), "16:9": (1344, 768), "9:16": (768, 1344),
 }
-ATTENTIONS = {"sdpa": None, "sage2": "sage_attn", "sage3": "sage_attn_3"}
+ATTENTIONS = {"sdpa": None, "sage2": "sage_attn"}
 # working resolution: the Turbo card edits at 2048x2048 (~4 MP); 1K is fastest
 RESOLUTIONS = {"1k": 1.0, "1.5k": 2.25, "2k": 4.0}
 
@@ -318,6 +318,8 @@ def main():
     ap.add_argument("--resolver-url", default=None, help="SGLang server running a small instruct LLM for follow-ups")
     ap.add_argument("--no-graphs", action="store_true", help="disable breakable CUDA graphs for the DiT")
     ap.add_argument("--steps", type=int, default=None, help="denoising steps (base model: e.g. 28; Turbo: leave unset)")
+    ap.add_argument("--lora", default=None, help="LoRA merged into the BF16 weights at load (before NVFP4 conversion)")
+    ap.add_argument("--sigmas", default=None, help="comma-separated schedule for the default (quality) preset, e.g. 1,0.75,0.5,0.25")
     ap.add_argument("--guidance", type=float, default=None, help="true CFG scale (base model: e.g. 4.0; Turbo: unset)")
     args = ap.parse_args()
 
@@ -330,6 +332,10 @@ def main():
     if not args.no_graphs:  # -17% per 1K edit; graphs bake attention in, so Sage2 is set for the DiT only
         _graphs = True
         extra.update(enable_breakable_cuda_graph=True, component_attention_backends={"transformer": "sage_attn"})
+    if args.lora:
+        extra.update(lora_path=args.lora, lora_merge_mode="merge" if quant != "int8" else "dynamic")
+    if args.sigmas:
+        SPEED_PRESETS["quality"] = [float(x) for x in args.sigmas.split(",")]
     _engine = Engine(args.model, out_dir=args.out, **extra)
     _engine.default_steps, _engine.default_guidance = args.steps, args.guidance
     os.chdir(_engine.out_dir)  # never inside the code tree: syncs must not remove the working directory

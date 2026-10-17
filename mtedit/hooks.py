@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 import torch
@@ -223,11 +224,35 @@ def run_denoising_step_around(original, self, ctx, step, batch, server_args):
     if state.DEBUG:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
+    before = ctx.latents.clone() if (mask.lock_sigma > 0 and not mask.locked) else None
     result = original(self, ctx, step, batch, server_args)
     if state.DEBUG:
         torch.cuda.synchronize()
         t1 = time.perf_counter()
-    ctx.latents = mask.blend(ctx.latents, _next_sigma(ctx.scheduler, step.step_index))
+    s1 = _next_sigma(ctx.scheduler, step.step_index)
+    dump = os.environ.get("MTEDIT_LOCK_DUMP")
+    if dump and before is not None:  # calibration: |x0_pred - source| per cell at every step
+        import numpy as np
+        sh = [float(x) for x in ctx.scheduler.sigmas.tolist()] + [0.0]
+        i = step.step_index
+        if sh[i + 1] > 0:
+            xp = ctx.latents - sh[i + 1] * (ctx.latents - before) / (sh[i + 1] - sh[i])
+            h, w = mask.hw
+            dd = (xp[:1].float() - mask.x0.to(xp).float()).view(h, w, -1)
+            os.makedirs(dump, exist_ok=True)
+            np.savez(f"{dump}/{int(time.time() * 1e3) % 10**9:09d}_s{i}.npz", d=dd.cpu().numpy(),
+                     inside=mask.inside.view(h, w).cpu().numpy(), editable=mask.editable.view(h, w).cpu().numpy(), sigma=sh[i + 1])
+    if before is not None and mask.inside is not None:
+        if mask.sigmas_host is None:  # one host sync per request, not per step
+            mask.sigmas_host = [float(x) for x in ctx.scheduler.sigmas.tolist()] + [0.0]
+        sh, i = mask.sigmas_host, step.step_index
+        s0f, s1f = sh[i], sh[i + 1]
+        half = 2 * (i + 1) >= len(sh) - 2  # the structure is set; >= 1 step left
+        if 0 < s1f <= mask.lock_sigma and half:
+            x0_pred = ctx.latents - s1f * (ctx.latents - before) / (s1f - s0f)
+            info = mask.lock(x0_pred)
+            logger.info("mtedit: change lock at step %d (sigma %.2f): %s", step.step_index, s1f, info)
+    ctx.latents = mask.blend(ctx.latents, s1)
     if state.DEBUG:
         torch.cuda.synchronize()
         logger.info(

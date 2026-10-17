@@ -73,3 +73,18 @@ def test_request_payload_roundtrip():
     assert mt.store_output_as == "s/v1" and mt.ref_latents == {0: "s/v0"}
     assert mt.mask.boxes == [(0.0, 0.0, 32.0, 32.0)]
     assert MTRequest.from_batch(object()).store_output_as is None
+
+
+def test_lock_freezes_unchanged_box_cells():
+    from mtedit.masking import rasterize_inside
+    spec = MaskSpec(boxes=[(64, 64, 192, 192)], feather_px=16)
+    editable = rasterize(spec, 256, 256).view(1, -1, 1)
+    inside = rasterize_inside(spec, 256, 256).view(1, -1, 1)
+    x0 = torch.randn(1, 256, 8)
+    st = MaskState(x0=x0, editable=editable, eps=torch.randn(1, 256, 8), inside=inside, hw=(16, 16), lock_sigma=0.6)
+    pred = x0 + 0.02 * torch.randn_like(x0)  # drift everywhere
+    g = pred.view(16, 16, 8); g[6:9, 6:9] += 2.0  # a new object in the box
+    info = st.lock(pred)
+    e = st.editable.view(16, 16)
+    assert e[7, 7] == 1 and e[11, 11] == 0 and info["changed"] > 0
+    assert e[0, 0] == 0

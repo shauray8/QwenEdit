@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from PIL import Image, ImageDraw, ImageFilter
 
 Box = tuple[float, float, float, float]
+# boxed edits: freeze re-rendered (unchanged) box cells to the source from this sigma on; 0 disables
+LOCK_SIGMA = float(os.environ.get("MTEDIT_LOCK", "0.75"))
 
 # Boxed edits: the worker outlines the boxes in red on the canvas the model sees
 # (Qwen-Image 2.1's mark-guided local editing) and the prompt names the mark.
@@ -745,7 +747,7 @@ class EditSession:
             mt["mask"] = {
                 "boxes": [list(b) for b in boxes], "canvas_ref": canvas_ref, "feather_px": feather_px,
                 "grow_px": grow_px, "annotate": self.mark_boxes or bool(regions),
-                "init_from_source": sdedit,
+                "init_from_source": sdedit, "lock_sigma": LOCK_SIGMA,
             }
             if colors:
                 mt["mask"]["colors"] = [list(c) for c in colors]
@@ -813,7 +815,8 @@ class EditSession:
             "prefix_cache": self.cache,
             **({"sigmas": list(sigmas)} if sigmas else {}),
             "mask": {"boxes": [list(b) for b in local], "canvas_ref": 0, "feather_px": feather_px,
-                     "grow_px": grow_px, "annotate": self.mark_boxes or bool(regions), "init_from_source": sdedit},
+                     "grow_px": grow_px, "annotate": self.mark_boxes or bool(regions), "init_from_source": sdedit,
+                     "lock_sigma": LOCK_SIGMA},
         }
         if colors:
             mt["mask"]["colors"] = [list(c) for c in colors]

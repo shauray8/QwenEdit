@@ -1,5 +1,5 @@
 #!/bin/bash
-# Full pod setup: venv, sglang@e6072935b + ConvRot fusion patch, CUDA 13, SageAttention 2/3,
+# Full pod setup: venv, sglang@e6072935b + ConvRot fusion patch, CUDA 13, SageAttention 2,
 # Turbo + PE-I2I weights, mtedit. Idempotent; logs to /workspace/mt/logs/setup_*.log.
 set -eu
 W=/workspace; L=$W/mt/logs; mkdir -p $L
@@ -11,7 +11,7 @@ step venv
 uv pip install -q --python $W/qi/bin/python "huggingface_hub[cli]" hf_transfer pytest fastapi uvicorn python-multipart gradio
 
 step weights
-( $W/qi/bin/hf download Qwen/Qwen-Image-2.1-Turbo >$L/setup_dl.log 2>&1 && $W/qi/bin/hf download Qwen/Qwen-Image-2.1-PE-I2I >>$L/setup_dl.log 2>&1 && $W/qi/bin/hf download Qwen/Qwen3-4B-Instruct-2507 >>$L/setup_dl.log 2>&1; echo "DL_EXIT=$?" >>$L/setup_dl.log ) &
+( $W/qi/bin/hf download Qwen/Qwen-Image-2.1-Turbo >$L/setup_dl.log 2>&1 && $W/qi/bin/hf download Qwen/Qwen3-4B-Instruct-2507 >>$L/setup_dl.log 2>&1; echo "DL_EXIT=$?" >>$L/setup_dl.log; $W/qi/bin/hf download Qwen/Qwen-Image-2.1 >$L/setup_dl2.log 2>&1 && $W/qi/bin/hf download lightx2v/Qwen-Image-2.1-Lightning pytorch_lora_weights.safetensors --local-dir $W/loras/lightning >>$L/setup_dl2.log 2>&1; echo "DL2_EXIT=$?" >>$L/setup_dl2.log; $W/qi/bin/hf download Qwen/Qwen-Image-2.1-PE-I2I >>$L/setup_dl2.log 2>&1 ) &
 
 step cuda13
 [ -d /usr/local/cuda-13.0 ] || DEBIAN_FRONTEND=noninteractive apt-get install -y -q cuda-toolkit-13-0 >$L/setup_cuda.log 2>&1
@@ -28,13 +28,12 @@ git apply --check $W/multi_turn/patches/convrot_fusions.patch 2>/dev/null && git
 uv pip install --python $W/qi/bin/python -e "python[diffusion]" >$L/setup_sglang.log 2>&1
 
 step sageattention
-if ! $W/qi/bin/python -c "import sageattention, sageattn3" 2>/dev/null; then
+if ! $W/qi/bin/python -c "import sageattention" 2>/dev/null; then  # Sage2 only: the editor never uses Sage3
   export TORCH_CUDA_ARCH_LIST=12.0 MAX_JOBS=48 EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8"
   rm -rf $W/SageAttention && git clone -q https://github.com/thu-ml/SageAttention.git $W/SageAttention && cd $W/SageAttention
   grep -rl "c++17" --include=setup.py . | xargs sed -i 's/c++17/c++20/g'
   uv pip install -q --python $W/qi/bin/python setuptools wheel ninja packaging
   $W/qi/bin/python -m pip install --no-build-isolation . >$L/setup_sage2.log 2>&1
-  cd sageattention3_blackwell && $W/qi/bin/python -m pip install --no-build-isolation . >$L/setup_sage3.log 2>&1
 fi
 
 step mtedit
