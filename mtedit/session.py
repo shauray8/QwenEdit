@@ -70,6 +70,7 @@ class Version:
     timings: dict = field(default_factory=dict)  # generate / post / save
     prompt: str | None = None  # the exact prompt sent to the model
     resolved: dict | None = None  # context resolver output: instruction, mode, target
+    change_box: Box | None = None  # where this edit actually changed the image (scene memory)
     children: list[str] = field(default_factory=list)
 
 
@@ -150,8 +151,38 @@ def _to_pil(result) -> Image.Image:
     return Image.fromarray(frame)
 
 
+def _pad_box(box, pad, size):
+    x0, y0, x1, y1 = box
+    return (max(0, x0 - pad), max(0, y0 - pad), min(size[0], x1 + pad), min(size[1], y1 + pad))
+
+
 def _round32(value: float) -> int:
     return max(32, int(round(value / 32)) * 32)
+
+
+def change_mask(new: Image.Image, old: Image.Image, threshold: float = 14.0, dilate_px: int = 24,
+                min_area_frac: float = 0.0005):
+    """Where ``new`` differs from ``old``: (feathered L mask, bounding box) or (None, None).
+
+    Computed on a 1/8 grid (fast, ignores pixel noise), then dilated so the kept
+    region includes the object's shadow and blend zone.
+    """
+    import numpy as np
+    from PIL import ImageFilter
+
+    w, h = new.size
+    small = (max(1, w // 8), max(1, h // 8))
+    a = np.asarray(new.convert("RGB").resize(small, Image.Resampling.BILINEAR), np.float32)
+    b = np.asarray(old.convert("RGB").resize(small, Image.Resampling.BILINEAR), np.float32)
+    diff = np.abs(a - b).mean(-1)
+    hit = diff > threshold
+    if hit.mean() < min_area_frac:
+        return None, None
+    ys, xs = np.nonzero(hit)
+    box = (int(xs.min()) * 8, int(ys.min()) * 8, (int(xs.max()) + 1) * 8, (int(ys.max()) + 1) * 8)
+    mask = Image.fromarray((hit * 255).astype(np.uint8)).resize((w, h), Image.Resampling.NEAREST)
+    mask = mask.filter(ImageFilter.MaxFilter(2 * (dilate_px // 2) + 1)).filter(ImageFilter.GaussianBlur(dilate_px / 3))
+    return mask, box
 
 
 def pixel_mask(size: tuple[int, int], boxes: list[Box], feather_px: float, grow_px: float) -> Image.Image:
@@ -385,6 +416,8 @@ class EditSession:
                 if not boxes and target:  # "make it red": edit where the referenced object was made
                     ref = lineage[target - 1]
                     boxes = ref.boxes or ([tuple(b) for b, _ in ref.regions] if ref.regions else None)
+                    if not boxes and ref.change_box:  # an unboxed edit: use where it actually changed
+                        boxes = [_pad_box(ref.change_box, 24, self.size)]
                 sdedit = resolved.get("mode") == "modify" and bool(boxes)
         colors = None
         if regions:  # per-box instructions: one outline color per box, named in the prompt
@@ -437,6 +470,11 @@ class EditSession:
             out = out.convert(source.mode)
             if boxes and self.paste_back:
                 out = Image.composite(out, source, pixel_mask(out.size, boxes, feather_px, grow_px))
+            elif not boxes and self.paste_back and resolved and resolved.get("mode") in ("add", "modify", "remove"):
+                # an unboxed local edit: keep only where it changed, so the rest cannot drift
+                changed, _ = change_mask(out, source)
+                if changed is not None:
+                    out = Image.composite(out, source, changed)
         else:
             out, result, latent_id = self._crop_edit(
                 parent, source, window, task, boxes, colors, regions, seed, feather_px, grow_px, vid, latent_id,
@@ -452,10 +490,12 @@ class EditSession:
         timings = dict(generate=generated - start, post=posted - generated, save=time.perf_counter() - posted,
                        crop=list(window) if window else None)
 
+        _, change_box = change_mask(out, source) if self.paste_back else (None, None)
         version = Version(
             id=vid, parent=parent.id, image_path=path, instruction=instruction, regions=regions,
             boxes=boxes, feather_px=feather_px, grow_px=grow_px, seed=seed,
             latent_id=latent_id, seconds=seconds, timings=timings, prompt=prompt, resolved=resolved,
+            change_box=change_box,
         )
         self.versions[vid] = version
         parent.children.append(vid)
