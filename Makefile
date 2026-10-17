@@ -10,7 +10,7 @@ MAKEFLAGS += --silent
 RP := scripts/rp
 POD := /workspace/multi_turn/scripts/pod
 
-.PHONY: sync setup logs enhancer editor url stop restart test check general bench pull status
+.PHONY: resolver sync setup logs enhancer editor url stop restart test check general bench pull status
 
 sync:
 	scripts/sync.sh
@@ -23,6 +23,9 @@ logs:
 
 enhancer: sync
 	echo 'pkill -f sglang.launch_server; sleep 3; setsid nohup $(POD)/enhancer.sh > /workspace/mt/logs/pe.log 2>&1 < /dev/null & disown; for i in $$(seq 1 100); do curl -sf localhost:30000/health >/dev/null && echo enhancer up && break; sleep 3; done' | $(RP)
+
+resolver: sync
+	echo 'pkill -f "served-model-name resolver"; sleep 3; setsid nohup $(POD)/resolver.sh > /workspace/mt/logs/resolver.log 2>&1 < /dev/null & disown; for i in $$(seq 1 100); do curl -sf localhost:30001/health >/dev/null && echo resolver up && break; sleep 3; done' | $(RP)
 
 editor: sync
 	echo 'pkill -f mtedit.server; sleep 4; setsid nohup $(POD)/editor.sh > /workspace/mt/logs/editor.log 2>&1 < /dev/null & disown; for i in $$(seq 1 80); do grep -q "Public URL" /workspace/mt/logs/editor.log && break; sleep 3; done; grep "Public URL" /workspace/mt/logs/editor.log' | $(RP)

@@ -69,6 +69,7 @@ class Version:
     seconds: float = 0.0
     timings: dict = field(default_factory=dict)  # generate / post / save
     prompt: str | None = None  # the exact prompt sent to the model
+    resolved: dict | None = None  # context resolver output: instruction, mode, target
     children: list[str] = field(default_factory=list)
 
 
@@ -157,7 +158,7 @@ def pixel_mask(size: tuple[int, int], boxes: list[Box], feather_px: float, grow_
     """Feathered editable mask in pixels (255 = take the new image)."""
     mask = Image.new("L", size, 0)
     draw = ImageDraw.Draw(mask)
-    pad = grow_px + feather_px / 2
+    pad = grow_px  # the blur is centered on the box edge: it feathers inward and outward
     for x0, y0, x1, y1 in boxes:
         draw.rectangle((x0 - pad, y0 - pad, x1 + pad, y1 + pad), fill=255)
     return mask.filter(ImageFilter.GaussianBlur(feather_px / 2)) if feather_px > 0 else mask
@@ -204,6 +205,8 @@ class EditSession:
         # boxed edits generate only a crop around the boxes (+ context margin) when it is small enough
         self.sigmas = sigmas  # explicit schedule, e.g. a Turbo subset for drafts
         self.attention: str | None = None  # DiT-only attention override, e.g. "sage_attn"
+        self.resolver = None  # mtedit.context.Resolver: makes follow-ups self-contained
+        self.modify_start_sigma = 0.85  # SDEdit start for boxed modify edits
         self.crop, self.crop_margin_px, self.crop_min_px, self.crop_max_frac = crop, crop_margin_px, crop_min_px, crop_max_frac  # warm the next turn's prefix in the background after each edit
         self._io = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"mtedit-{session_id or 'io'}")
         self._saves: dict[str, Future] = {}
@@ -368,6 +371,21 @@ class EditSession:
         canvas_ref = len(refs) - 1
         template = self.template if len(refs) == 2 else "{instruction}"
         instruction = (instruction or "").strip()
+        resolved, sdedit = None, False
+        if self.resolver is not None and instruction and not regions and not raw_prompt:
+            lineage = [v for v in self.lineage(parent.id) if v.parent is not None]
+            history = [(i + 1, v.instruction or "; ".join(t for _, t in (v.regions or []))) for i, v in enumerate(lineage)]
+            try:
+                resolved = self.resolver.resolve(history, instruction)
+            except Exception as err:  # the resolver is an aid, never a blocker
+                resolved = {"error": str(err)}
+            if "instruction" in resolved:
+                instruction = resolved["instruction"]
+                target = resolved.get("target")
+                if not boxes and target:  # "make it red": edit where the referenced object was made
+                    ref = lineage[target - 1]
+                    boxes = ref.boxes or ([tuple(b) for b, _ in ref.regions] if ref.regions else None)
+                sdedit = resolved.get("mode") == "modify" and bool(boxes)
         colors = None
         if regions:  # per-box instructions: one outline color per box, named in the prompt
             if len(regions) > len(MARK_PALETTE):
@@ -388,6 +406,8 @@ class EditSession:
         vid = f"v{self._counter:03d}"
         latent_id = f"{self.id}/{vid}"
         sigmas = sigmas if sigmas is not None else self.sigmas
+        if sdedit:  # keep geometry: start from the noised source, skip the high-noise steps
+            sigmas = [s for s in (sigmas or TURBO_SIGMAS) if s <= self.modify_start_sigma] or None
         attention = attention or self.attention
         mt: dict = {"store_output_as": latent_id, "prefix_cache": self.cache}
         if sigmas:
@@ -398,6 +418,7 @@ class EditSession:
             mt["mask"] = {
                 "boxes": [list(b) for b in boxes], "canvas_ref": canvas_ref, "feather_px": feather_px,
                 "grow_px": grow_px, "annotate": self.mark_boxes or bool(regions),
+                "init_from_source": sdedit,
             }
             if colors:
                 mt["mask"]["colors"] = [list(c) for c in colors]
@@ -419,7 +440,7 @@ class EditSession:
         else:
             out, result, latent_id = self._crop_edit(
                 parent, source, window, task, boxes, colors, regions, seed, feather_px, grow_px, vid, latent_id,
-                sigmas, attention,
+                sigmas, attention, sdedit,
             )
             generated = time.perf_counter()
         posted = time.perf_counter()
@@ -434,7 +455,7 @@ class EditSession:
         version = Version(
             id=vid, parent=parent.id, image_path=path, instruction=instruction, regions=regions,
             boxes=boxes, feather_px=feather_px, grow_px=grow_px, seed=seed,
-            latent_id=latent_id, seconds=seconds, timings=timings, prompt=prompt,
+            latent_id=latent_id, seconds=seconds, timings=timings, prompt=prompt, resolved=resolved,
         )
         self.versions[vid] = version
         parent.children.append(vid)
@@ -444,7 +465,7 @@ class EditSession:
         return version
 
     def _crop_edit(self, parent, source, window, task, boxes, colors, regions, seed, feather_px, grow_px, vid, latent_id,
-                   sigmas=None, attention=None):
+                   sigmas=None, attention=None, sdedit=False):
         """Generate only ``window`` and paste it back; returns (full image, result, latent id or None)."""
         x0, y0, x1, y1 = window
         cells = [x0 // 16, y0 // 16, x1 // 16, y1 // 16]
@@ -456,7 +477,7 @@ class EditSession:
             "prefix_cache": self.cache,
             **({"sigmas": list(sigmas)} if sigmas else {}),
             "mask": {"boxes": [list(b) for b in local], "canvas_ref": 0, "feather_px": feather_px,
-                     "grow_px": grow_px, "annotate": self.mark_boxes or bool(regions)},
+                     "grow_px": grow_px, "annotate": self.mark_boxes or bool(regions), "init_from_source": sdedit},
         }
         if colors:
             mt["mask"]["colors"] = [list(c) for c in colors]

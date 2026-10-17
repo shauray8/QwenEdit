@@ -302,4 +302,5 @@ def _prepare_mask(batch, mt, conditions, shapes, clean=None):
     batch.extra[MASK_EXTRA_KEY] = MaskState(
         x0=source[:1],
         editable=editable.view(1, -1, 1).to(source.device),
+        init_from_source=spec.init_from_source,
     )

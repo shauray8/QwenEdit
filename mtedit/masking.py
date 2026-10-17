@@ -29,11 +29,13 @@ def rasterize(spec: MaskSpec, height: int, width: int) -> torch.Tensor:
     weight = torch.zeros(h, w)
     for x0, y0, x1, y1 in spec.boxes:
         x0, y0, x1, y1 = x0 - spec.grow_px, y0 - spec.grow_px, x1 + spec.grow_px, y1 + spec.grow_px
-        # signed distance outside the box along each axis (<= 0 inside)
-        dy = torch.maximum(y0 - ys, ys - y1).clamp(min=0)[:, None]
-        dx = torch.maximum(x0 - xs, xs - x1).clamp(min=0)[None, :]
-        dist = torch.sqrt(dx * dx + dy * dy)
-        weight = torch.maximum(weight, (1 - dist / feather).clamp(min=0))
+        # signed distance to the box edge (negative inside); the ramp is centered on the edge so it
+        # feathers inward as well as outward: a slightly shifted object blends instead of seaming
+        dy = torch.maximum(y0 - ys, ys - y1)[:, None]
+        dx = torch.maximum(x0 - xs, xs - x1)[None, :]
+        outside = torch.sqrt(dx.clamp(min=0) ** 2 + dy.clamp(min=0) ** 2)
+        signed = torch.where((dx <= 0) & (dy <= 0), torch.maximum(dx, dy), outside)
+        weight = torch.maximum(weight, (0.5 - signed / feather).clamp(0, 1))
     return weight.reshape(-1)
 
 
@@ -42,6 +44,7 @@ class MaskState:
     x0: torch.Tensor  # [1, HW, C] source latents (normalized, packed)
     editable: torch.Tensor  # [1, HW, 1]
     eps: torch.Tensor | None = None
+    init_from_source: bool = False
 
     def blend(self, latents: torch.Tensor, sigma) -> torch.Tensor:
         """``sigma`` is a float or a 0-d tensor (kept on device to avoid a host sync)."""

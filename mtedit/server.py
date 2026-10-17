@@ -45,6 +45,7 @@ ATTENTIONS = {"sdpa": None, "sage2": "sage_attn", "sage3": "sage_attn_3"}
 
 _engine: Engine | None = None
 _enhancer = None
+_resolver = None
 _sessions: dict[str, EditSession] = {}
 _thumbs: dict[tuple, bytes] = {}
 _lock = threading.Lock()
@@ -75,6 +76,8 @@ def _configure(session: EditSession, body: dict) -> None:
     session.attention = ATTENTIONS[attention]
     if "crop" in body:
         session.crop = bool(body["crop"])
+    # follow-ups ("make it red") are rewritten against the history unless the client turns it off
+    session.resolver = _resolver if body.get("context", True) else None
 
 
 def _regions(body: dict):
@@ -120,7 +123,7 @@ def create_app() -> FastAPI:
     @app.get("/api/config")
     def config():
         return {"speeds": list(SPEED_PRESETS), "attentions": list(ATTENTIONS), "aspects": ASPECTS,
-                "palette": [{"name": n, "rgb": c} for n, c in MARK_PALETTE], "enhancer": _enhancer is not None,
+                "palette": [{"name": n, "rgb": c} for n, c in MARK_PALETTE], "enhancer": _enhancer is not None, "context": _resolver is not None,
                 "model": _engine.model_path}
 
     @app.post("/api/generate")
@@ -227,7 +230,7 @@ def create_app() -> FastAPI:
 
 
 def main():
-    global _engine, _enhancer
+    global _engine, _enhancer, _resolver
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen-Image-2.1-Turbo")
     ap.add_argument("--int8", action="store_true", help="online INT8 ConvRot DiT (needs CUDA_HOME at CUDA 13)")
@@ -236,6 +239,7 @@ def main():
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--share", action="store_true", help="public *.gradio.live link via Gradio's share tunnel")
     ap.add_argument("--enhancer-url", default=None, help="SGLang server running Qwen/Qwen-Image-2.1-PE-I2I")
+    ap.add_argument("--resolver-url", default=None, help="SGLang server running a small instruct LLM for follow-ups")
     args = ap.parse_args()
 
     import uvicorn
@@ -247,6 +251,10 @@ def main():
         from mtedit.enhance import Enhancer
 
         _enhancer = Enhancer(args.enhancer_url)
+    if args.resolver_url:
+        from mtedit.context import Resolver
+
+        _resolver = Resolver(args.resolver_url)
     if args.share:
         from gradio.networking import setup_tunnel
 

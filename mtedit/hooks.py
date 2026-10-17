@@ -177,6 +177,9 @@ def run_denoising_step_around(original, self, ctx, step, batch, server_args):
         return original(self, ctx, step, batch, server_args)
     if mask.eps is None:
         mask.eps = ctx.latents.detach().clone()  # the request's own initial noise
+        if mask.init_from_source:  # SDEdit start: the source noised to the schedule's first sigma
+            sigma = ctx.scheduler.sigmas[0]
+            ctx.latents = (1 - sigma) * mask.x0.to(ctx.latents) + sigma * mask.eps.to(ctx.latents)
     if state.DEBUG:
         torch.cuda.synchronize()
         t0 = time.perf_counter()

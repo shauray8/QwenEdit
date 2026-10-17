@@ -31,6 +31,9 @@ class MaskSpec:
     mark_width_px: float = 6.0
     # optional per-box outline colors (multi-region edits name each box by its color)
     colors: list[tuple[int, int, int]] | None = None
+    # modify edits: start the whole latent from the source noised to the schedule's first sigma
+    # (SDEdit) instead of pure noise, so geometry inside the box stays aligned with the outside
+    init_from_source: bool = False
 
 
 @dataclass
@@ -68,6 +71,7 @@ class MTRequest:
                 mark_color=tuple(int(c) for c in mask.get("mark_color", (255, 0, 0))),
                 mark_width_px=float(mask.get("mark_width_px", 6.0)),
                 colors=[tuple(int(c) for c in rgb) for rgb in mask["colors"]] if mask.get("colors") else None,
+                init_from_source=bool(mask.get("init_from_source", False)),
             )
             if mask
             else None,

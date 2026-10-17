@@ -11,7 +11,7 @@ step venv
 uv pip install -q --python $W/qi/bin/python "huggingface_hub[cli]" hf_transfer pytest fastapi uvicorn python-multipart gradio
 
 step weights
-( $W/qi/bin/hf download Qwen/Qwen-Image-2.1-Turbo >$L/setup_dl.log 2>&1 && $W/qi/bin/hf download Qwen/Qwen-Image-2.1-PE-I2I >>$L/setup_dl.log 2>&1; echo "DL_EXIT=$?" >>$L/setup_dl.log ) &
+( $W/qi/bin/hf download Qwen/Qwen-Image-2.1-Turbo >$L/setup_dl.log 2>&1 && $W/qi/bin/hf download Qwen/Qwen-Image-2.1-PE-I2I >>$L/setup_dl.log 2>&1 && $W/qi/bin/hf download Qwen/Qwen3-4B-Instruct-2507 >>$L/setup_dl.log 2>&1; echo "DL_EXIT=$?" >>$L/setup_dl.log ) &
 
 step cuda13
 [ -d /usr/local/cuda-13.0 ] || DEBIAN_FRONTEND=noninteractive apt-get install -y -q cuda-toolkit-13-0 >$L/setup_cuda.log 2>&1

@@ -50,11 +50,12 @@ def test_sequence_ids_chain_over_image_runs():
 
 
 def test_rasterize_box_is_one_inside_zero_far_outside():
-    spec = MaskSpec(boxes=[(64, 64, 128, 128)], feather_px=16)
+    spec = MaskSpec(boxes=[(64, 64, 128, 128)], feather_px=32)
     m = rasterize(spec, 256, 256).view(16, 16)
-    assert m[4:8, 4:8].min() == 1  # cells 4..7 cover pixels 64..127
+    assert m[5:7, 5:7].min() == 1  # the box interior
+    assert 0.5 < m[4, 5] < 1  # inner edge cell: feathered inward
+    assert 0 < m[3, 5] < 0.5  # outer neighbor: feathered outward
     assert m[0, 0] == 0 and m[15, 15] == 0
-    assert 0 < m[3, 5] < 1  # feathered neighbor
 
 
 def test_blend_keeps_source_outside_at_sigma_zero():
