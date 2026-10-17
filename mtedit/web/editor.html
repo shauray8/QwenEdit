@@ -76,10 +76,14 @@ svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width:
 .empty:not(.dim) { top: 50%; transform: translate(-50%, -50%); }
 .start { width: 100%; background: rgba(22,22,27,.62); backdrop-filter: blur(14px) saturate(1.2); -webkit-backdrop-filter: blur(14px) saturate(1.2);
   border: 1px solid var(--line-2); border-radius: 16px; padding: 14px; box-shadow: var(--shadow); transition: opacity .15s; }
-.empty.dim .start { opacity: .5; }
-.empty.dim .start:hover, .empty.dim .start:focus-within { opacity: 1; }
+/* while editing: a small panel beside the rail, closed until the rail's create button opens it */
+.empty.dim { display: none; left: 12px; top: 12px; transform: none; width: min(440px, calc(100% - 24px)); }
+.empty.dim.open { display: block; }
+.empty.dim .start { background: rgba(22,22,27,.92); }
 .empty.dim .start p, .empty.dim .start h2 { display: none; }
-.empty.dim textarea { min-height: 44px; }
+.empty.dim textarea { min-height: 60px; }
+.empty .hint { display: none; margin-top: 8px; color: var(--muted); font-size: 12px; }
+.empty.dim .hint { display: block; }
 .start.working { opacity: .5 !important; pointer-events: none; }
 .aspects button { display: inline-flex; align-items: center; gap: 6px; }
 .aspects svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.6; }
@@ -162,7 +166,7 @@ aside .head h3 { margin: 0 auto 0 0; font-size: 13px; }
       <button class="icon-btn" id="clearBoxes" title="Clear boxes (Esc)"><svg viewBox="0 0 24 24"><path d="M5 5l14 14M19 5L5 19"/></svg></button>
       <div class="sep"></div>
       <button class="icon-btn" id="compareBtn" title="Hold to compare with the previous version (Space)"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M12 5v14"/></svg></button>
-      <button class="icon-btn" id="newBtn" title="New image"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+      <button class="icon-btn" id="newBtn" title="Create an image from text"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
       <a class="icon-btn" id="download" title="Download current" download><svg viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg></a>
     </nav>
 
@@ -178,6 +182,7 @@ aside .head h3 { margin: 0 auto 0 0; font-size: 13px; }
             <span style="flex:1"></span>
             <button class="primary" id="genBtn">Generate</button>
           </div>
+          <div class="hint" id="genHint">Opens as a new image. Select a box first to use the result as its item.</div>
         </div>
       </div>
       <div class="frame" id="frame" hidden>
@@ -379,7 +384,7 @@ function summary(v) {
 }
 function show(data, { keepBoxes = false } = {}) {
   S.session = data;
-  $("empty").classList.add("dim"); $("frame").hidden = false; $("dock").classList.add("on");
+  $("empty").classList.add("dim"); $("empty").classList.remove("open"); $("newBtn").classList.remove("on"); $("frame").hidden = false; $("dock").classList.add("on");
   const head = data.versions[data.head];
   // the preview that came with the response shows at once; the full-resolution PNG follows
   S.previews = S.previews || {};
@@ -471,9 +476,17 @@ async function doEnhance() {
 async function generate() {
   const prompt = $("genPrompt").value.trim(); if (!prompt) return toast("Write a prompt to generate an image.");
   const seed = $("optSeed").value;
-  busy(true, "Generating");
+  const target = S.session && S.sel >= 0 ? S.sel : -1;  // a selected box: the image becomes its item
+  if (target < 0) busy(true, "Generating");
   $("empty").querySelector(".start").classList.add("working");
-  try { show(await api("/api/generate", { prompt, aspect: S.aspect, resolution: $("optRes").value, seed: seed === "" ? null : +seed })); }
+  try {
+    const g = await api("/api/generate", { prompt, aspect: S.aspect, resolution: target >= 0 ? "1k" : $("optRes").value, seed: seed === "" ? null : +seed });
+    if (target >= 0) {
+      const blob = await (await fetch(`/api/sessions/${g.id}/image/${g.head}`)).blob();
+      await attachObject(target, new File([blob], "item.png", { type: blob.type || "image/png" }));
+    } else show(g);
+    $("empty").classList.remove("open"); $("newBtn").classList.remove("on");
+  }
   catch (err) { toast(err.message); } finally { busy(false); $("empty").querySelector(".start").classList.remove("working"); }
 }
 async function upload(file) {
@@ -506,7 +519,12 @@ $("rerollBtn").onclick = () => { if (!S.session) return; S._t0 = performance.now
   run(() => api(`/api/sessions/${S.session.id}/reroll`, common()), "Generating").then((d) => { if (d) S._lastVid = d.head; }); };
 $("undoBtn").onclick = () => S.session && run(() => api(`/api/sessions/${S.session.id}/undo`, {}), null);
 $("clearBoxes").onclick = () => { S.boxes = []; S.sel = -1; renderBoxes(); };
-$("newBtn").onclick = () => { $("genPrompt").focus(); $("genPrompt").select(); };
+$("newBtn").onclick = () => {
+  if (!S.session) return $("genPrompt").focus();
+  const open = $("empty").classList.toggle("open"); $("newBtn").classList.toggle("on", open);
+  if (open) { $("genHint").textContent = S.sel >= 0 ? "Will become the selected box's item (1K)." : "Opens as a new image. Select a box first to use the result as its item.";
+    $("genPrompt").focus(); }
+};
 $("genBtn").onclick = generate;
 $("genPrompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) generate(); });
 $("file").addEventListener("change", () => upload($("file").files[0]));
@@ -536,6 +554,7 @@ document.addEventListener("keydown", (e) => {
   if (typing) return;
   if ((e.metaKey || e.ctrlKey) && e.key === "z") { e.preventDefault(); $("undoBtn").click(); }
   else if (e.key === "r" || e.key === "R") $("rerollBtn").click();
+  else if (e.key === "Escape" && $("empty").classList.contains("open")) { $("empty").classList.remove("open"); $("newBtn").classList.remove("on"); }
   else if (e.key === "Escape") $("clearBoxes").click();
   else if ((e.key === "Backspace" || e.key === "Delete") && S.sel >= 0) { S.boxes.splice(S.sel, 1); S.sel = -1; renderBoxes(); }
   else if (e.key === "b" || e.key === "B") $("prompt").blur();
