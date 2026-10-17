@@ -270,7 +270,9 @@ def main():
     global _engine, _enhancer, _resolver, _graphs
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen-Image-2.1-Turbo")
-    ap.add_argument("--int8", action="store_true", help="online INT8 ConvRot DiT (needs CUDA_HOME at CUDA 13)")
+    ap.add_argument("--int8", action="store_true", help="alias for --quant int8")
+    ap.add_argument("--quant", default="nvfp4", choices=["nvfp4", "int8", "bf16"],
+                    help="DiT weights/activations: nvfp4 (flashinfer W4A4, fastest), int8 (ConvRot), bf16")
     ap.add_argument("--out", default="mt_out")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
@@ -282,7 +284,10 @@ def main():
 
     import uvicorn
 
-    extra = {"component_quantizations": {"transformer": "convrot_int8"}} if args.int8 else {}
+    quant = "int8" if args.int8 else args.quant
+    extra = {"component_quantizations": {"transformer": "convrot_int8"}} if quant == "int8" else {}
+    if quant == "nvfp4":  # loaded in BF16, converted to NVFP4 in the worker on the first denoising call
+        os.environ["MTEDIT_NVFP4"] = "1"
     if not args.no_graphs:  # -17% per 1K edit; graphs bake attention in, so Sage2 is set for the DiT only
         _graphs = True
         extra.update(enable_breakable_cuda_graph=True, component_attention_backends={"transformer": "sage_attn"})
