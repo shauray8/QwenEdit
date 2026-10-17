@@ -231,7 +231,7 @@ def change_mask(new: Image.Image, old: Image.Image, threshold: float = 14.0, dil
 
 
 def blend_box_edit(out: Image.Image, source: Image.Image, boxes, feather_px: float, grow_px: float,
-                   band_px: int = 12, keep_lo: float = 2.0, keep_hi: float = 6.0) -> Image.Image:
+                   band_px: int = 12, keep_lo: float = 2.0, keep_hi: float = 6.0, locked: bool | None = None) -> Image.Image:
     """Paste a boxed edit back so it matches its surroundings.
 
     1. tone-match: per channel, map the generated box's colors so that a thin band just
@@ -251,7 +251,7 @@ def blend_box_edit(out: Image.Image, source: Image.Image, boxes, feather_px: flo
     if (ux0, uy0, ux1, uy1) != (0, 0, W, H):
         local = [(b[0] - ux0, b[1] - uy0, b[2] - ux0, b[3] - uy0) for b in boxes]
         patch = blend_box_edit(out.crop((ux0, uy0, ux1, uy1)), source.crop((ux0, uy0, ux1, uy1)), local,
-                               feather_px, grow_px, band_px, keep_lo, keep_hi)
+                               feather_px, grow_px, band_px, keep_lo, keep_hi, locked)
         full = source.copy()
         full.paste(patch, (ux0, uy0))
         return full
@@ -260,7 +260,11 @@ def blend_box_edit(out: Image.Image, source: Image.Image, boxes, feather_px: flo
     src = np.asarray(source.convert("RGB"), np.float32)
     h, w = o.shape[:2]
     result = o.copy()
-    for x0, y0, x1, y1 in boxes:
+    # with the change lock the re-rendered background inside the box already IS the source (latent-exact):
+    # no tone/cast correction (it would only shift the new object's colors) and no inward edge fade (it
+    # turned objects touching the box edge see-through, the old image showing under them)
+    locked = LOCK_SIGMA > 0 if locked is None else locked
+    for x0, y0, x1, y1 in ([] if locked else boxes):
         x0, y0 = max(0, int(x0)), max(0, int(y0))
         x1, y1 = min(w, int(x1)), min(h, int(y1))
         if x1 - x0 < 4 * band_px + 24 or y1 - y0 < 4 * band_px + 24:
@@ -299,7 +303,12 @@ def blend_box_edit(out: Image.Image, source: Image.Image, boxes, feather_px: flo
             continue
         edge = np.ones((bh, bw), bool)
         edge[16:-16, 16:-16] = False
-        if np.abs(result[y0:y1, x0:x1] - src[y0:y1, x0:x1]).mean(-1)[edge].mean() < 2 * keep_hi:
+        edge_diff = np.abs(result[y0:y1, x0:x1] - src[y0:y1, x0:x1]).mean(-1)[edge]
+        if edge_diff.mean() < 2 * keep_hi:
+            continue
+        # locked: only a restyle of the whole box (the lock stands down) needs the fade; an object that merely
+        # touches the edge must stay solid
+        if locked and (edge_diff > 2 * keep_hi).mean() < 0.7:
             continue
         ramp = max(48.0, min(300.0, 0.25 * min(bw, bh)))
         ys = np.arange(y0, y1, dtype=np.float32)[:, None]

@@ -86,5 +86,5 @@ def test_lock_freezes_unchanged_box_cells():
     g = pred.view(16, 16, 8); g[6:9, 6:9] += 2.0  # a new object in the box
     info = st.lock(pred)
     e = st.editable.view(16, 16)
-    assert e[7, 7] == 1 and e[11, 11] == 0 and info["changed"] > 0
+    assert e[7, 7] == 1 and e[4, 4] == 1 and e[11, 11] < 1 and info["changed"] > 0
     assert e[0, 0] == 0

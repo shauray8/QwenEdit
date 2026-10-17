@@ -82,15 +82,18 @@ class MaskState:
             return {"skipped": "no outside reference"}
         floor = torch.quantile(d[outside], 0.9).clamp(min=min_floor)
         # calibrated on 5 box edits at Turbo sigma 0.70: the best object/background split is 1.95-3.25x the
-        # outside drift (88-93% of cells right); ramp over 2-3x so faint effects (smoke, glow) fade out softly
-        changed = ((d - lo * floor) / ((hi - lo) * floor)).clamp(0, 1)
-        thr = floor * (lo + hi) / 2
-        frac = (changed[inside] > 0.5).float().mean()
+        # outside drift (88-93% of cells right). Binary at 2x (the generous end): a changed cell is fully
+        # regenerated, never a mix with the source, which reads as a soft ghost of the previous version
+        thr = floor * lo
+        hard = (d > thr).float()
+        frac = hard[inside].mean()
         if frac < 0.01:  # nothing clearly changed yet: do not erase a subtle edit
             return {"skipped": "no change", "floor": float(floor)}
-        c = changed[None, None]
-        c = F.max_pool2d(c, 3, 1, 1)  # one cell (16 px) margin: contact shadows, edges
-        c = F.avg_pool2d(F.pad(c, (1, 1, 1, 1), mode="replicate"), 3, 1)  # soft border
+        if frac > 0.7:  # a restyle of the whole box: lock nothing
+            return {"skipped": "restyle", "changed": float(frac)}
+        c = F.max_pool2d(hard[None, None], 5, 1, 2)  # two cells (32 px) fully kept around every change
+        # soften only outward: the blur may add weight beyond the kept cells, never remove it inside them
+        c = torch.maximum(c, F.avg_pool2d(F.pad(c, (1, 1, 1, 1), mode="replicate"), 3, 1))
         c = c.view(1, -1, 1)
         ins = self.inside.to(c)
         e = self.editable.to(c)
