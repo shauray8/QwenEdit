@@ -273,7 +273,7 @@ def pixel_mask(size: tuple[int, int], boxes: list[Box], feather_px: float, grow_
     """Feathered editable mask in pixels (255 = take the new image)."""
     mask = Image.new("L", size, 0)
     draw = ImageDraw.Draw(mask)
-    pad = grow_px  # the blur is centered on the box edge: it feathers inward and outward
+    pad = grow_px + feather_px / 2  # fully editable inside the box; the blur falls outside it
     for x0, y0, x1, y1 in boxes:
         draw.rectangle((x0 - pad, y0 - pad, x1 + pad, y1 + pad), fill=255)
     return mask.filter(ImageFilter.GaussianBlur(feather_px / 2)) if feather_px > 0 else mask

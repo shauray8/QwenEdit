@@ -29,13 +29,12 @@ def rasterize(spec: MaskSpec, height: int, width: int) -> torch.Tensor:
     weight = torch.zeros(h, w)
     for x0, y0, x1, y1 in spec.boxes:
         x0, y0, x1, y1 = x0 - spec.grow_px, y0 - spec.grow_px, x1 + spec.grow_px, y1 + spec.grow_px
-        # signed distance to the box edge (negative inside); the ramp is centered on the edge so it
-        # feathers inward as well as outward: a slightly shifted object blends instead of seaming
-        dy = torch.maximum(y0 - ys, ys - y1)[:, None]
-        dx = torch.maximum(x0 - xs, xs - x1)[None, :]
-        outside = torch.sqrt(dx.clamp(min=0) ** 2 + dy.clamp(min=0) ** 2)
-        signed = torch.where((dx <= 0) & (dy <= 0), torch.maximum(dx, dy), outside)
-        weight = torch.maximum(weight, (0.5 - signed / feather).clamp(0, 1))
+        # fully editable inside the box, feathered outward only: an inward ramp pulls the original back
+        # into the box edge, leaving remnants of removed objects in tight boxes
+        dy = torch.maximum(y0 - ys, ys - y1).clamp(min=0)[:, None]
+        dx = torch.maximum(x0 - xs, xs - x1).clamp(min=0)[None, :]
+        dist = torch.sqrt(dx * dx + dy * dy)
+        weight = torch.maximum(weight, (1 - dist / feather).clamp(min=0))
     return weight.reshape(-1)
 
 
