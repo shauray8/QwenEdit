@@ -166,18 +166,6 @@ def _may_refer(request: str) -> bool:
     return len(request.split()) <= 4 or bool(_REFERRING.search(request))
 
 
-_MOVE = re.compile(r"\b(move|moves|moving|drag|shift|relocate|put .* (in|into|to) the blue)\b", re.I)
-
-
-def _move_composite(image: Image.Image, boxes) -> Image.Image:
-    """Copy the first box's pixels into the second box (resized to fit)."""
-    (sx0, sy0, sx1, sy1), (dx0, dy0, dx1, dy1) = [tuple(int(round(v)) for v in b) for b in boxes]
-    patch = image.crop((sx0, sy0, sx1, sy1)).resize((max(1, dx1 - dx0), max(1, dy1 - dy0)), Image.Resampling.LANCZOS)
-    out = image.copy()
-    out.paste(patch, (dx0, dy0))
-    return out
-
-
 def _pad_box(box, pad, size):
     x0, y0, x1, y1 = box
     return (max(0, x0 - pad), max(0, y0 - pad), min(size[0], x1 + pad), min(size[1], y1 + pad))
@@ -540,8 +528,7 @@ class EditSession:
                 # no silent box reuse: an edit without a drawn box has no box (and no box wording)
                 sdedit = self.sdedit_modify and resolved.get("mode") == "modify" and bool(boxes)
         colors = None
-        # one chain: labeled boxes (regions), a two-box move, plain boxes, or text only
-        move = not regions and bool(boxes) and len(boxes) == 2 and bool(_MOVE.search(instruction))
+        # one chain: labeled boxes (regions), plain boxes, or text only
         if regions:  # per-box instructions: one outline color per box, named in the prompt
             if len(regions) > len(MARK_PALETTE):
                 raise ValueError(f"at most {len(MARK_PALETTE)} regions per edit")
@@ -549,15 +536,6 @@ class EditSession:
             parts = [f"Inside the {MARK_PALETTE[i][0]} box: {text.strip().rstrip('.')}." for i, (_, text) in enumerate(regions)]
             colors = [MARK_PALETTE[i][1] for i in range(len(regions))]
             task = REGION_TEMPLATE.format(regions=" ".join(parts) + " ", instruction=instruction).replace("  ", " ")
-        elif move:
-            # "move X from the red box to the blue box": copy the red box's pixels into the blue box first,
-            # so the moved thing is exactly the same; the model only erases the source and blends the target
-            colors = [MARK_PALETTE[0][1], MARK_PALETTE[1][1]]
-            task = ("Inside the red box, remove the object completely and show only the empty background that "
-                    "belongs there, continuing the surrounding pattern and colors. Inside the blue box, keep the "
-                    "object exactly as it is (same object, color, size and style) and only blend its edges "
-                    "naturally into the surroundings. Remove all colored box outlines completely and keep "
-                    "everything outside the boxes unchanged.")
         elif boxes and self.mark_boxes:
             names = [n for n, _ in MARK_PALETTE]
             if len(boxes) > 1 or re.search(r"\b(" + "|".join(names) + r")\s+(box|square|area|region)", instruction, re.I):
@@ -607,17 +585,12 @@ class EditSession:
                 mt["mask"]["colors"] = [list(c) for c in colors]
         seed = int(time.time_ns() % (2**31)) if seed is None else seed
         source = self._image_cache.get(base.id) or Image.open(self.path(base.id))
-        canvas = _move_composite(source, boxes) if move else source  # what the model sees (pre-blend)
         window = self.crop_rect(boxes) if boxes and self.crop else None
 
         start = time.perf_counter()
         if window is None:
-            images = [self._file(r.id) for r in refs]
-            if move:  # the model sees the composite as its canvas
-                images[-1] = os.path.join(self.dir, f"{vid}_move.png")
-                canvas.save(images[-1], compress_level=1)
             out, result = self.engine.run(
-                prompt=prompt, images=images, width=self.size[0], height=self.size[1],
+                prompt=prompt, images=[self._file(r.id) for r in refs], width=self.size[0], height=self.size[1],
                 seed=seed, mt=mt, name=f"session_{self.id}_{vid}_raw", steps=self.steps,
                 guidance_scale=self.guidance_scale, attention=attention,
             )
@@ -630,7 +603,7 @@ class EditSession:
         else:
             out, result, latent_id = self._crop_edit(
                 parent, source, window, task, boxes, colors, regions, seed, feather_px, grow_px, vid, latent_id,
-                sigmas, attention, sdedit, canvas=canvas,
+                sigmas, attention, sdedit,
             )
             generated = time.perf_counter()
         posted = time.perf_counter()
@@ -659,14 +632,14 @@ class EditSession:
         return version
 
     def _crop_edit(self, parent, source, window, task, boxes, colors, regions, seed, feather_px, grow_px, vid, latent_id,
-                   sigmas=None, attention=None, sdedit=False, canvas=None):
+                   sigmas=None, attention=None, sdedit=False):
         """Generate only ``window`` and paste it back; returns (full image, result, latent id or None)."""
         x0, y0, x1, y1 = window
         cells = [x0 // 16, y0 // 16, x1 // 16, y1 // 16]
         local = [(bx0 - x0, by0 - y0, bx1 - x0, by1 - y0) for bx0, by0, bx1, by1 in boxes]
         crop_image = source.crop(window)
         crop_path = os.path.join(self.dir, f"{vid}_in.png")
-        (canvas or source).crop(window).save(crop_path, compress_level=1)  # the model's canvas (a move composite)
+        crop_image.save(crop_path, compress_level=1)
         mt: dict = {
             "prefix_cache": self.cache,
             **({"sigmas": list(sigmas)} if sigmas else {}),
