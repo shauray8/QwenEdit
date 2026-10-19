@@ -5,3 +5,6 @@ mt_out/
 *.pyc
 .DS_Store
 pod_out/
+.deps/
+out/
+*.swp

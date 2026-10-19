@@ -1,11 +1,11 @@
-"""GPU validation for mtedit: correctness of every cache path, masks, passthrough, timings.
+"""GPU validation for multi_turn: correctness of every cache path, masks, passthrough, timings.
 
-  MTEDIT_DEBUG=1 python scripts/gpu_check.py --model Qwen/Qwen-Image-2.1-Turbo --image chess_test/board_clean.png
+  MULTI_TURN_DEBUG=1 python scripts/gpu_check.py --model Qwen/Qwen-Image-2.1-Turbo --image assets/board.png
 
 Checks (same seed throughout):
   miss     first cached request == uncached request (store insert must not change compute)
   hit      identical request again: full prefix from the store, == uncached
-  partial  same image, new prompt: header + image from the store, prompt prefilled by mtedit
+  partial  same image, new prompt: header + image from the store, prompt prefilled by multi_turn
   mask     boxed edit: raw output outside the boxes vs the source
   chain    3 passthrough turns vs 3 VAE re-encode turns (drift of untouched area)
 """
@@ -46,14 +46,14 @@ def outside_diff(out: Image.Image, src: Image.Image, boxes, margin=24):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen-Image-2.1-Turbo")
-    ap.add_argument("--image", default="chess_test/board_clean.png")
-    ap.add_argument("--out", default="/workspace/mt/check")
+    ap.add_argument("--image", default="assets/board.png")
+    ap.add_argument("--out", default="out/check")
     ap.add_argument("--size", type=int, default=1024)
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--int8", action="store_true", help="online INT8 ConvRot DiT (needs CUDA_HOME at CUDA 13)")
     args = ap.parse_args()
 
-    from mtedit.session import Engine, EditSession
+    from multi_turn.app.session import Engine, EditSession
 
     os.makedirs(args.out, exist_ok=True)
     extra = {"component_quantizations": {"transformer": "convrot_int8"}} if args.int8 else {}
@@ -76,7 +76,6 @@ def main():
     p1 = "Move the white pawn from e2 to e4. Keep every other square and piece exactly unchanged."
     p2 = "Move the white knight from g1 to f3. Keep every other square and piece exactly unchanged."
 
-    # warm up kernels/allocator so timings compare steady state
     run("warmup", p1, {"prefix_cache": False}, seed=1)
 
     base1, t_base1 = run("p1_nocache", p1, {"prefix_cache": False})
@@ -100,7 +99,6 @@ def main():
         ),
     )
 
-    # mask: e2 -> e4 boxes on a 1024 board (128 px squares, a1 bottom-left)
     sq = size / 8
     def box(square):
         f, r = "abcdefgh".index(square[0]), int(square[1])
@@ -116,7 +114,6 @@ def main():
         seconds=t_mask,
     )
 
-    # chain drift: passthrough vs VAE re-encode, paste-back off to see the raw model drift
     moves = [("e2", "e4", "white pawn"), ("e7", "e5", "black pawn"), ("g1", "f3", "white knight")]
     drift = {}
     for passthrough in (True, False):

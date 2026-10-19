@@ -1,137 +1,64 @@
-# mtedit: multi-turn image editing for Qwen-Image 2.1 on SGLang
+# multi_turn
 
-An SGLang-Diffusion plugin, a session library and a small server for
-multi-turn, region-aware editing: any sequence of add / remove / replace /
-restyle edits on any image, with optional boxes, re-roll, undo and branching.
-SGLang's source is not modified; everything hooks in through its plugin system.
+Fast multi-turn image editing for Qwen-Image 2.1 on SGLang.
 
-## What it does
+## Install
 
-| Feature | Where | Effect |
+Needs an NVIDIA GPU and a CUDA toolkit (`CUDA_HOME`). NVFP4 needs Blackwell; use `--quant int8` otherwise.
+
+```
+python -m venv .venv && source .venv/bin/activate
+make setup
+```
+
+## Run
+
+```
+python -m multi_turn.app.server            # http://127.0.0.1:8000
+python -m multi_turn.app.server --share    # plus a public *.gradio.live link
+```
+
+Optional helpers, each on its own:
+
+```
+make resolver   # follow-up rewriting   -> --resolver-url http://127.0.0.1:30001
+make enhancer   # prompt enhancer       -> --enhancer-url http://127.0.0.1:30000
+```
+
+## Flags
+
+| Flag | Default | |
 |---|---|---|
-| DiT prefix K/V reuse across requests | `paged.py`, `keys.py`, `prefill.py`, `hooks.py` | Reference images and prompt text already prefilled by an earlier request are not prefilled again. Re-rolls, undo/branching, re-prompting and CFG branches reuse it. A full hit hands the DiT zero-copy views into the pool. |
-| Text-encoder (Qwen3-VL) prefix reuse | `encoder_cache.py` | Same for the VLM: a full hit skips the encoder; a partial hit runs only the new tail (bottom-right causal mask, per-image vision features, deepstack). Cold requests run upstream unchanged. |
-| Paged pools on SGLang's LLM cache | `paged.py` | `sglang.srt` `RadixCache` (token radix tree, node splitting, lock refs, leaf-first LRU eviction) indexes a preallocated pool with `TokenToKVPoolAllocator` slots. |
-| Latent passthrough | `encoding.py`, `hooks.py` | A previous output's final latents become the next turn's condition latents (no VAE decode→encode drift). |
-| Region edits | `encoding.py`, `masking.py`, `session.py` | Boxes are outlined on the canvas the model sees (Qwen-Image 2.1's mark-guided local editing) and named in the prompt; a latent mask keeps everything outside on the clean source; the session pastes the source pixels back. |
-| INT8 ConvRot | `Engine(..., component_quantizations={"transformer": "convrot_int8"})` | SGLang's online INT8 DiT path; all cache paths verified on it. |
-| Multi-region edits | `session.py` | `regions=[(box, "what goes here"), ...]`: each box gets its own outline color and instruction in one edit. |
-| Text-to-image | `Engine.text_to_image` | Generated bases keep their latents for the first edit. |
-| Prefix warming | `EditSession(prewarm=True)` | After an edit, the next turn's prefix is prefilled in the background. |
-| Sessions, workspace, API | `session.py`, `gradio_app.py`, `server.py` | Version tree with edit / re-roll / undo / checkout, `chain` and `anchor` layouts; Gradio editing workspace; FastAPI JSON API. |
-
-## Why prefix reuse is exact
-
-The DiT runs one sequence: a prefix (text tokens and reference image blocks)
-then the target. The prefix uses timestep-0 modulation, so its K/V is the same
-at every step, and its attention is block-causal (text causal; an image block
-sees what precedes it and itself). A position's K/V therefore depends only on
-the inputs up to and including its block. `keys.virtual_ids` gives every prefix
-position a chained 63-bit id over raw inputs (token ids, image pixels or a
-latent id): text positions chain per token, and every position of an image
-block includes the block's content key, so blocks match whole or not at all.
-Equal ids mean equal K/V; the radix tree finds the longest stored prefix. The
-text encoder is plain causal, so the same scheme applies per token.
-
-## Correctness (RTX PRO 6000, Turbo, 1024², 8 steps)
-
-- Cache miss and full hit are byte-identical to the uncached path, in BF16 and INT8.
-- Partial DiT hits (cached image, new prompt tail) are byte-identical in INT8 and 52.5 dB in BF16.
-- Edits that reuse the text encoder's prefix differ from upstream only in low bits
-  (46–61 dB PSNR): a tail-only forward cannot reproduce the full-sequence kernels bit for bit.
-- Photo suite (`scripts/general_check.py`): add, remove, replace, global restyle and
-  text edits on five photos with re-roll and undo; cached and uncached sessions are
-  visually identical, and boxed edits leave the outside unchanged (≤ 2 levels at the feather).
-
-## How it hooks into SGLang
-
-Registered through the `sglang.multimodal_gen.plugins` entry point, so it loads
-in every SGLang process (including spawned GPU workers) once installed:
-
-- `QwenImage21EncodingStage.forward`: AROUND, replaced by a copy of upstream with marked
-  additions; fingerprint-checked against upstream on first call
-- `QwenImage21DenoisingStage._predict_noise`: AROUND (pool lookup, partial prefill, insert)
-- `QwenImage21DenoisingStage._run_denoising_step`: AROUND (latent mask blend)
-- `QwenImage21PipelineConfig.post_denoising_loop`: AROUND (keep final latents, release pool locks)
-
-Per-request options travel in `diffusers_kwargs["mt"]`, which SGLang already
-forwards into `batch.extra` from `DiffGenerator.generate` and `/v1/images/generations`:
-
-```json
-{"mt": {
-  "store_output_as": "sess/v003",
-  "ref_latents": {"0": "sess/v002"},
-  "mask": {"boxes": [[512, 768, 640, 896]], "canvas_ref": 0, "feather_px": 16, "annotate": true},
-  "prefix_cache": true
-}}
-```
-
-Requests without `mt` still get automatic prefix reuse.
-
-## Usage
-
-```python
-from mtedit.session import Engine, EditSession
-
-engine = Engine("Qwen/Qwen-Image-2.1-Turbo", out_dir="mt_out",
-                component_quantizations={"transformer": "convrot_int8"})
-s = EditSession(engine, "photo.jpg")                      # layout="anchor" keeps the original as image 1
-s.edit("Add a white ceramic mug of coffee on the table.", boxes=[(40, 600, 300, 900)])
-s.reroll()                                                # same edit, new seed; prefix fully cached
-s.undo()
-s.edit("Replace the background with a snowy forest.")    # no box: a global edit
-```
-
-Editor (custom web UI; `--share` exposes it through a Gradio share tunnel for pods with no open ports):
-
-```
-CUDA_HOME=/usr/local/cuda-13.0 python -m mtedit.server --int8 --share \
-    [--enhancer-url http://127.0.0.1:30000]   # SGLang serving Qwen/Qwen-Image-2.1-PE-I2I
-```
-
-Generate or drop an image, drag boxes on the canvas and type what goes in each
-(colors are assigned automatically), optionally add an overall instruction, press
-Enter. Quality / Fast / Draft picks 8 / 5 / 4 Turbo steps. ✨ Enhance rewrites the
-instruction with Qwen's official edit enhancer into an editable prompt. History on
-the right: click a version to continue or branch from it; R re-rolls, ⌘Z undoes,
-hold Space to compare with the previous version.
-
-## Speed (RTX PRO 6000, Turbo, INT8 ConvRot + fused LN/SwiGLU rotates, Sage2 DiT attention)
-
-| Edit | Time |
-|---|---|
-| Full frame, 8 steps | ~1.25 s |
-| Full frame, 5 steps (Fast) | ~0.9 s |
-| Small boxed edit, crop + Fast | ~0.4–0.75 s |
-| Re-roll | prefix fully cached |
-
-One DiT step of an edit is ~150 ms of CUDA time: INT8 GEMMs 52% (at the INT8 ceiling),
-attention 37% before Sage2 (the reference prefix doubles K/V), fused rotate/LN/residual ~7%.
+| `--model` | `Qwen/Qwen-Image-2.1-Turbo` | model path or HF id |
+| `--quant` | `nvfp4` | `nvfp4`, `int8` or `bf16` DiT |
+| `--int8` | | same as `--quant int8` |
+| `--host` / `--port` | `127.0.0.1` / `8000` | |
+| `--share` | off | public Gradio tunnel |
+| `--out` | `mt_out` | output folder |
+| `--resolver-url` | | SGLang server for follow-ups |
+| `--enhancer-url` | | SGLang server running Qwen-Image-2.1-PE-I2I |
+| `--no-graphs` | off | disable CUDA graphs |
+| `--steps` | model's | denoising steps (base model) |
+| `--sigmas` | Turbo's 8 | schedule for the Quality preset, e.g. `1,0.75,0.5,0.25` |
+| `--guidance` | | CFG scale (base model) |
+| `--lora` | | LoRA merged into the weights at load |
 
 ## Environment
 
 | Variable | Default | |
 |---|---|---|
-| `MTEDIT_PREFIX_CACHE` | `1` | DiT prefix reuse |
-| `MTEDIT_ENCODER_CACHE` | `1` | text-encoder prefix reuse |
-| `MTEDIT_KV_GPU_GIB` | `24` | DiT pool (512 KiB/token; a 1024² reference is 4096 tokens = 2 GiB) |
-| `MTEDIT_ENC_GPU_GIB` | `4` | encoder pool (~152 KiB/token) |
-| `MTEDIT_MIN_REUSE` / `MTEDIT_ENC_MIN_REUSE` | `256` / `128` | shorter matches run the upstream fused prefill instead |
-| `MTEDIT_LATENT_SLOTS` | `512` | stored output latents / VAE encodes |
-| `MTEDIT_DEBUG` | `0` | per-request reuse and encoder phase timing |
+| `MULTI_TURN_KV_GPU_GIB` | `24` | DiT prefix cache size |
+| `MULTI_TURN_ENC_GPU_GIB` | `4` | text-encoder prefix cache size |
+| `MULTI_TURN_PREFIX_CACHE` | `1` | DiT prefix reuse |
+| `MULTI_TURN_ENCODER_CACHE` | `1` | text-encoder prefix reuse |
+| `MULTI_TURN_LOCK` | `0.75` | box-edit change lock sigma, `0` disables |
+| `MULTI_TURN_DEBUG` | `0` | log cache reuse per request |
 
-## Limits
+Running the resolver or enhancer on the same GPU: lower the caches, e.g. `MULTI_TURN_KV_GPU_GIB=16 MULTI_TURN_ENC_GPU_GIB=3`.
 
-- Single GPU (no TP/SP): the pools hold whole-prefix K/V per device. No host-memory tier yet.
-- A mask's canvas reference must have the target size (always true inside a session).
-- Boxes are hard constraints: an object that extends past its box is cut at the box.
-- Breakable CUDA graphs are untested with the pools (slower than eager for Q21 on this card).
-
-## Layout
+## Test
 
 ```
-mtedit/         plugin, pools, encoder cache, sessions, server, playground
-tests/          unit tests (paged-pool tests need sglang)
-scripts/        pod helpers (rp, sync.sh, pod_setup.sh), gpu_check, general_check, bench_sessions
-chess_test/     manual chess-move experiment inputs
+make test                                  # unit tests
+python scripts/gpu_check.py                # cache correctness on the GPU
 ```

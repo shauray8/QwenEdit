@@ -1,17 +1,17 @@
-"""PagedKVPool over SGLang's RadixCache + TokenToKVPoolAllocator (needs sglang; runs on the pod)."""
+"""PagedKVPool over SGLang's RadixCache + TokenToKVPoolAllocator (needs sglang)."""
 
 import numpy as np
 import pytest
 import torch
 
 pytest.importorskip("sglang.srt.mem_cache.radix_cache")
-from mtedit.paged import PagedKVPool  # noqa: E402
+from multi_turn.cache.paged import PagedKVPool
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def make(tokens):
-    per_token = 2 * 2 * 1 * 4 * 2  # layers=2, K+V, heads=1, dim=4, bf16
+    per_token = 2 * 2 * 1 * 4 * 2
     return PagedKVPool("t", 2, 1, 4, tokens * per_token, torch.bfloat16, DEVICE)
 
 
@@ -46,11 +46,11 @@ def test_eviction_respects_locks():
     pool = make(16)
     a = np.arange(1, 11, dtype=np.int64)
     fill(pool, a, 1.0)
-    held = pool.match(a)  # locked
-    assert pool.alloc(10) is None or pool.match(a).length == 10  # cannot evict the locked prefix
+    held = pool.match(a)
+    assert pool.alloc(10) is None or pool.match(a).length == 10
     held.release()
     b = np.arange(1000, 1012, dtype=np.int64)
-    fill(pool, b, 3.0)  # now evicts a
+    fill(pool, b, 3.0)
     assert pool.match(a).length < 10
     assert pool.usage()["evicted_tokens"] >= 6
 

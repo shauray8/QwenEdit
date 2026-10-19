@@ -3,11 +3,10 @@
 import torch
 from PIL import Image
 
-from mtedit import keys
-from mtedit.masking import MaskState, rasterize
-from mtedit.request import MaskSpec, MTRequest
+from multi_turn.cache import keys
+from multi_turn.pipeline.masking import MaskState, rasterize
+from multi_turn.request import MaskSpec, MTRequest
 
-# a layout like build_layout's: text [0,3), image 2x2 [3,7), text [7,9)
 SEGMENTS = ((0, 3, False), (3, 7, True), (7, 9, False))
 TEXT_INDICES = [0, 1, 2, 3, 3, 3, 3, 4, 5]
 IDS_A = [10, 11, 12, 99, 20, 21]
@@ -28,7 +27,7 @@ def vids(ids, image=b"img1"):
 
 def test_virtual_ids_share_head_and_split_at_first_difference():
     a, b = vids(IDS_A), vids(IDS_B)
-    assert (a[:7] == b[:7]).all()  # text + image identical
+    assert (a[:7] == b[:7]).all()
     assert a[7] != b[7] and a[8] != b[8]
     assert len(set(a.tolist())) == len(a)
 
@@ -36,7 +35,7 @@ def test_virtual_ids_share_head_and_split_at_first_difference():
 def test_virtual_ids_image_block_matches_whole_or_not_at_all():
     a, c = vids(IDS_A), vids(IDS_A, b"img2")
     assert (a[:3] == c[:3]).all()
-    assert not (a[3:7] == c[3:7]).any()  # every block position differs, so no partial block match
+    assert not (a[3:7] == c[3:7]).any()
     assert not (a[7:] == c[7:]).any()
 
 
@@ -52,8 +51,8 @@ def test_sequence_ids_chain_over_image_runs():
 def test_rasterize_box_is_one_inside_zero_far_outside():
     spec = MaskSpec(boxes=[(64, 64, 128, 128)], feather_px=16)
     m = rasterize(spec, 256, 256).view(16, 16)
-    assert m[4:8, 4:8].min() == 1  # the whole box interior, including its edge cells
-    assert 0 < m[3, 5] < 1  # outer neighbor: feathered outward
+    assert m[4:8, 4:8].min() == 1
+    assert 0 < m[3, 5] < 1
     assert m[0, 0] == 0 and m[15, 15] == 0
 
 
@@ -76,14 +75,14 @@ def test_request_payload_roundtrip():
 
 
 def test_lock_freezes_unchanged_box_cells():
-    from mtedit.masking import rasterize_inside
+    from multi_turn.pipeline.masking import rasterize_inside
     spec = MaskSpec(boxes=[(64, 64, 192, 192)], feather_px=16)
     editable = rasterize(spec, 256, 256).view(1, -1, 1)
     inside = rasterize_inside(spec, 256, 256).view(1, -1, 1)
     x0 = torch.randn(1, 256, 8)
     st = MaskState(x0=x0, editable=editable, eps=torch.randn(1, 256, 8), inside=inside, hw=(16, 16), lock_sigma=0.6)
-    pred = x0 + 0.02 * torch.randn_like(x0)  # drift everywhere
-    g = pred.view(16, 16, 8); g[6:9, 6:9] += 2.0  # a new object in the box
+    pred = x0 + 0.02 * torch.randn_like(x0)
+    g = pred.view(16, 16, 8); g[6:9, 6:9] += 2.0
     info = st.lock(pred)
     e = st.editable.view(16, 16)
     assert e[7, 7] == 1 and e[4, 4] == 1 and e[11, 11] < 1 and info["changed"] > 0

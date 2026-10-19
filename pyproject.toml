@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mtedit"
+name = "multi_turn"
 version = "0.1.0"
 description = "Multi-turn image editing for Qwen-Image 2.1 on SGLang: cross-request prefix KV reuse, latent passthrough, region masks"
 requires-python = ">=3.10"
@@ -15,10 +15,10 @@ share = ["gradio>=5"]  # only for its share tunnel (--share)
 
 # Loaded by SGLang-Diffusion in every process (CLI, scheduler, GPU workers).
 [project.entry-points."sglang.multimodal_gen.plugins"]
-mtedit = "mtedit.plugin:register"
+multi_turn = "multi_turn.plugin:register"
 
 [tool.setuptools.packages.find]
-include = ["mtedit*"]
+include = ["multi_turn*"]
 
 [tool.setuptools.package-data]
-mtedit = ["web/*.html"]
+multi_turn = ["app/*.html"]
