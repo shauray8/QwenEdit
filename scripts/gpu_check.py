@@ -1,6 +1,6 @@
 """GPU validation for multi_turn: correctness of every cache path, masks, passthrough, timings.
 
-  MULTI_TURN_DEBUG=1 python scripts/gpu_check.py --model Qwen/Qwen-Image-2.1-Turbo --image assets/board.png
+  MULTI_TURN_DEBUG=1 python scripts/gpu_check.py --model Qwen/Qwen-Image-2.1-Turbo [--image photo.png]
 
 Checks (same seed throughout):
   miss     first cached request == uncached request (store insert must not change compute)
@@ -46,7 +46,7 @@ def outside_diff(out: Image.Image, src: Image.Image, boxes, margin=24):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen-Image-2.1-Turbo")
-    ap.add_argument("--image", default="assets/board.png")
+    ap.add_argument("--image", help="source image; generated from a fixed prompt if omitted")
     ap.add_argument("--out", default="out/check")
     ap.add_argument("--size", type=int, default=1024)
     ap.add_argument("--repeats", type=int, default=3)
@@ -60,7 +60,12 @@ def main():
     engine = Engine(args.model, out_dir=args.out, **extra)
     size = args.size
     src_path = os.path.join(args.out, "src.png")
-    Image.open(args.image).convert("RGB").resize((size, size), Image.Resampling.LANCZOS).save(src_path)
+    if args.image:
+        source = Image.open(args.image).convert("RGB").resize((size, size), Image.Resampling.LANCZOS)
+    else:
+        source, _ = engine.text_to_image("A cozy desk by a window: a mug, a lamp, a plant and an open book.",
+                                         width=size, height=size, seed=0)
+    source.save(src_path)
     src = Image.open(src_path)
     report = {}
 
@@ -73,8 +78,8 @@ def main():
         print(f"[{tag}] {dt:.3f}s", flush=True)
         return img, dt
 
-    p1 = "Move the white pawn from e2 to e4. Keep every other square and piece exactly unchanged."
-    p2 = "Move the white knight from g1 to f3. Keep every other square and piece exactly unchanged."
+    p1 = "Make the mug red. Keep everything else exactly unchanged."
+    p2 = "Turn the lamp on. Keep everything else exactly unchanged."
 
     run("warmup", p1, {"prefix_cache": False}, seed=1)
 
@@ -88,6 +93,7 @@ def main():
     report["cache"] = dict(
         miss_identical=identical(miss1, base1),
         hit_identical=all(identical(h, base1) for h, _ in hits),
+        hit_psnr_min=min(psnr(h, base1) for h, _ in hits),
         partial_psnr_vs_nocache=psnr(part2, base2),
         partial_identical=identical(part2, base2),
         seconds=dict(
@@ -99,31 +105,29 @@ def main():
         ),
     )
 
-    sq = size / 8
-    def box(square):
-        f, r = "abcdefgh".index(square[0]), int(square[1])
-        return (f * sq, (8 - r) * sq, (f + 1) * sq, (9 - r) * sq)
-    boxes = [box("e2"), box("e4")]
-    pm = ("Move the white pawn from the upper-left marked square region to the other: the pawn on e2 moves to e4, "
-          "e2 becomes an empty light square. Keep every other square and piece exactly unchanged.")
-    masked, t_mask = run("mask_e2e4", pm, {"mask": {"boxes": [list(b) for b in boxes], "canvas_ref": 0, "feather_px": 16}})
-    unmasked, _ = run("nomask_e2e4", pm, {})
+    def box(x0, y0, x1, y1):
+        return (x0 * size, y0 * size, x1 * size, y1 * size)
+    boxes = [box(0.1, 0.55, 0.35, 0.85)]
+    pm = "Put a small potted cactus in the marked region. Keep everything else exactly unchanged."
+    masked, t_mask = run("mask", pm, {"mask": {"boxes": [list(b) for b in boxes], "canvas_ref": 0, "feather_px": 16}})
+    unmasked, _ = run("nomask", pm, {})
     report["mask"] = dict(
         outside_mean_max_masked=outside_diff(masked, src, boxes),
         outside_mean_max_unmasked=outside_diff(unmasked, src, boxes),
         seconds=t_mask,
     )
 
-    moves = [("e2", "e4", "white pawn"), ("e7", "e5", "black pawn"), ("g1", "f3", "white knight")]
+    steps = [((0.05, 0.05, 0.3, 0.3), "Add a framed photo here."),
+             ((0.7, 0.05, 0.95, 0.3), "Add a wall clock here."),
+             ((0.65, 0.6, 0.9, 0.9), "Add a stack of books here.")]
     drift = {}
     for passthrough in (True, False):
         s = EditSession(engine, src_path, size=(size, size), passthrough=passthrough, paste_back=False)
         all_boxes = []
-        for a, b, piece in moves:
-            bx = [box(a), box(b)]
+        for frac, prompt in steps:
+            bx = [box(*frac)]
             all_boxes += bx
-            s.edit(f"Move the {piece} from {a} to {b}; {a} becomes an empty square. Keep everything else exactly unchanged.",
-                   boxes=bx, seed=7)
+            s.edit(prompt, boxes=bx, seed=7)
         drift["passthrough" if passthrough else "vae_reencode"] = dict(
             outside_mean_max=outside_diff(s.image(), src, all_boxes),
             final=s.path(),
