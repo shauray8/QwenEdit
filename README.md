@@ -1,6 +1,8 @@
-# multi_turn
+# Multi Turn Edit with Qwen Image 2.1
+Fast(ish) multi-turn edit for Qwen-Image 2.1. Tested on a 6k pro.
 
-Fast multi-turn image editing for Qwen-Image 2.1 on SGLang.
+https://github.com/user-attachments/assets/f5ded4fb-e019-4cbf-9fdf-a6d46ba684d9
+
 
 ## Install
 
