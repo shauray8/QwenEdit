@@ -3,6 +3,8 @@ Fast(ish) multi-turn edit for Qwen-Image 2.1. Tested on a 6k pro.
 
 https://github.com/user-attachments/assets/f5ded4fb-e019-4cbf-9fdf-a6d46ba684d9
 
+Edit latency on an RTX PRO 6000 (NVFP4, 8 steps): 1K full image 0.9 s, 2K full image 4.4 s, 2K box edit 3.9–5.2 s, small box 0.4–1 s.
+
 
 ## Install
 
