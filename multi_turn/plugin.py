@@ -78,3 +78,7 @@ def register() -> None:
         f"{CONFIG}.QwenImage21PipelineConfig.post_denoising_loop", _post_denoising_loop, HookType.AROUND
     )
     logger.info("multi_turn: registered Qwen-Image 2.1 multi-turn hooks")
+
+    from multi_turn.fibo.pipeline import register as register_fibo
+
+    register_fibo()
