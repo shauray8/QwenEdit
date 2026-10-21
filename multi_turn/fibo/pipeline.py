@@ -335,7 +335,12 @@ class FiboEncodingStage(PipelineStage):
 
 
 def _trained_size(image, area=DEFAULT_AREA, multiple=16):
-    aspect, min_side = image.width / image.height, 4 * multiple
+    return trained_size(image.width, image.height, area, multiple)
+
+
+def trained_size(width, height, area=DEFAULT_AREA, multiple=16):
+    """The (width, height) Fibo 2.0 was trained at for this aspect ratio, about ``area`` (Bria's get_image_size)."""
+    aspect, min_side = width / height, 4 * multiple
     sizes = [(w, h) for w in range(min_side, 2 * area // min_side, multiple)
              for h in range(min_side, 2 * area // w, multiple) if 0.9 * area <= w * h <= 1.1 * area]
     return min(sizes, key=lambda s: (round(1 - min(s[0] / s[1] / aspect, aspect / (s[0] / s[1])), 9),
