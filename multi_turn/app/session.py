@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from PIL import Image, ImageDraw, ImageFilter
@@ -61,10 +62,14 @@ class Version:
     base: str | None = None
     standalone: bool = False
     objects: dict | None = None
+    model: str | None = None
     children: list[str] = field(default_factory=list)
 
 
 class Engine:
+    # SGLang's DiffGenerator talks through one module-level scheduler client; each engine keeps its own and swaps it
+    # in per call, so several models can share a process
+    _gpu = threading.Lock()
 
     def __init__(self, model_path: str = "Qwen/Qwen-Image-2.1-Turbo", out_dir: str = "mt_out",
                  attention: str | None = None, **server_kwargs):
@@ -72,13 +77,31 @@ class Engine:
 
         server_kwargs.setdefault("performance_mode", "speed")
         self.model_path = model_path
+        # Fibo has no stored latents, prefix cache or box marks; a box edit greys the box out instead
+        self.family = "fibo" if "fibo" in model_path.lower() else "qwen"
         self.default_steps = None
         self.default_guidance = None
         self.attention = attention
         self.out_dir = os.path.abspath(out_dir)
         os.makedirs(self.out_dir, exist_ok=True)
         self.generator = DiffGenerator.from_pretrained(model_path=model_path, **server_kwargs)
-        self.lock = threading.Lock()
+        from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
+
+        self.client = SchedulerClient()
+        self.client.initialize(self.generator.server_args)
+        self.lock = self._gpu
+
+    @contextmanager
+    def _active(self):
+        from sglang.multimodal_gen.runtime.entrypoints import diffusion_generator
+
+        with self.lock:
+            saved = diffusion_generator.sync_scheduler_client
+            diffusion_generator.sync_scheduler_client = self.client
+            try:
+                yield
+            finally:
+                diffusion_generator.sync_scheduler_client = saved
 
     def run(self, *, prompt, images, width, height, seed, mt, name, steps=None, guidance_scale=None, save=False,
             attention=None):
@@ -93,6 +116,9 @@ class Engine:
             output_file_name=name,
             diffusers_kwargs={"mt": mt},
         )
+        if self.family == "fibo":
+            boxes = (mt.get("mask") or {}).get("boxes")
+            kwargs["diffusers_kwargs"] = {"fibo": {"mask_boxes": boxes} if boxes else {}}
         steps = steps if steps is not None else self.default_steps
         guidance_scale = guidance_scale if guidance_scale is not None else self.default_guidance
         if steps is not None:
@@ -102,7 +128,7 @@ class Engine:
         attention = attention or self.attention
         if attention:
             kwargs["attention_backend_override"] = attention
-        with self.lock:
+        with self._active():
             result = self.generator.generate(sampling_params_kwargs=kwargs)
         result = result[0] if isinstance(result, list) else result
         if result is None:
@@ -119,7 +145,8 @@ class Engine:
         return image, latent_id
 
     def shutdown(self):
-        self.generator.shutdown()
+        with self._active():
+            self.generator.shutdown()
 
 
 def _to_pil(result) -> Image.Image:
@@ -419,6 +446,9 @@ class EditSession:
         return [parent]
 
     def prewarm(self, version: str | None = None, background: bool = True):
+        engine = self.engine  # bound now: the session may switch models before this runs
+        if engine.family != "qwen":
+            return None
         parent = self.versions[version or self.head]
         refs = self._refs(parent)
         template = self.template if len(refs) == 2 else "{instruction}"
@@ -430,7 +460,7 @@ class EditSession:
                 mt["store_ref_as"] = missing
 
         def run():
-            self.engine.run(
+            engine.run(
                 prompt=template.format(instruction=""), images=[self._file(r.id) for r in refs],
                 width=self.size[0], height=self.size[1], seed=0, mt=mt, name=f"session_{self.id}_warm",
                 steps=self.steps, guidance_scale=self.guidance_scale,
@@ -587,6 +617,14 @@ class EditSession:
                     instruction=instruction.rstrip(" .") + ".")
         else:
             task = instruction
+        fibo = self.engine.family == "fibo"
+        if fibo:
+            refs, canvas_ref, template = [base], 0, "{instruction}"
+            task = instruction
+            if regions:
+                task = " ".join(f"{t.strip().rstrip('.')}." for _, t in regions) + (f" {instruction}" if instruction else "")
+            if object_paths:
+                task += " " + " ".join(f"Use the item shown in image_{object_index[i]}." for i in sorted(object_index))
         if raw_prompt:
             task = raw_prompt.strip()
         prompt = template.format(instruction=task)
@@ -617,6 +655,8 @@ class EditSession:
         source = self._image_cache.get(base.id) or Image.open(self.path(base.id))
         window = self.crop_rect(boxes) if boxes and self.crop else None
 
+        if fibo:
+            latent_id = None
         start = time.perf_counter()
         if window is None:
             out, result = self.engine.run(
@@ -651,6 +691,7 @@ class EditSession:
             change_box=change_box, request=request or None, base=base.id,
             standalone=bool(request) and not boxes and not regions and merged is None,
             objects={i: object_paths[object_index[i] - len(refs) - 1] for i in object_index} or None,
+            model=self.engine.family,
         )
         self.versions[vid] = version
         parent.children.append(vid)
@@ -679,7 +720,7 @@ class EditSession:
         if object_paths:
             scale = min(1.0, OBJECT_REF_PIXELS / ((x1 - x0) * (y1 - y0)))
             mt["ref_scales"] = {1 + k: scale for k in range(len(object_paths))}
-        if self.passthrough and parent.latent_id:
+        if self.passthrough and parent.latent_id and self.engine.family == "qwen":
             mt["ref_latents"] = {0: parent.latent_id}
             mt["ref_latent_crops"] = {0: cells}
             mt["compose"] = {"base": parent.latent_id, "box": cells, "as": latent_id}
