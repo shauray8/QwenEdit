@@ -31,6 +31,7 @@ header { display: flex; align-items: center; gap: 14px; padding: 0 14px; border-
 .seg button small { color: var(--dim); font-weight: 450; margin-left: 4px; }
 #modelSeg { margin: 0 0 0 12px; }
 .seg[hidden], .chip[hidden] { display: none; }
+button.locked { opacity: .45; cursor: not-allowed; }
 .mtag { display: inline-block; padding: 0 6px; border-radius: 999px; border: 1px solid var(--line-2); font-size: 11px; line-height: 16px; }
 .mtag.fibo { color: #f0a35e; border-color: #f0a35e66; }
 .mtag.qwen { color: #7fb0ff; border-color: #7fb0ff66; }
@@ -482,6 +483,7 @@ async function doEnhance() {
 
 // ---- start: generate / upload
 async function generate() {
+  if (S.genLocked) return;
   const prompt = $("genPrompt").value.trim(); if (!prompt) return toast("Write a prompt to generate an image.");
   const seed = $("optSeed").value;
   const target = S.session && S.sel >= 0 ? S.sel : -1;  // a selected box: the image becomes its item
@@ -579,10 +581,11 @@ document.addEventListener("keyup", (e) => { if (e.key === " " && S.compare) comp
     $("modelSeg").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x.dataset.v === m));
     $("speed").hidden = m !== "qwen";  // Fibo Turbo has one 4-step schedule
     $("fiboSteps").hidden = m === "qwen";
-    // Fibo 2.0 Edit only edits; new images always come from Qwen
-    const viaQwen = m !== "qwen" && S.config.models.includes("qwen");
-    $("genBtn").textContent = viaQwen ? "Generate with Qwen" : "Generate";
-    $("genBtn").title = viaQwen ? "Fibo 2.0 Edit Turbo is an edit model; text-to-image runs on Qwen-Image 2.1" : "";
+    // Fibo 2.0 Edit Turbo only edits: generate is locked (not disabled, so the hover tip still shows)
+    S.genLocked = m === "fibo";
+    $("genBtn").classList.toggle("locked", S.genLocked);
+    $("genBtn").setAttribute("aria-disabled", S.genLocked);
+    $("genBtn").title = S.genLocked ? "Fibo is edit-only for now: upload a photo, or switch to Qwen to generate" : "";
   };
   if (S.config.models.length > 1) {
     $("model").hidden = true; $("modelSeg").hidden = false;
