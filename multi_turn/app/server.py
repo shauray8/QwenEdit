@@ -30,7 +30,9 @@ def _scaled(size, megapixels):
     s = (megapixels / ((w * h) / (1024 * 1024))) ** 0.5
     return max(32, round(w * s / 32) * 32), max(32, round(h * s / 32) * 32)
 
-_engine: Engine | None = None
+MODELS = {"qwen": "Qwen/Qwen-Image-2.1-Turbo", "fibo": "briaai/Fibo-2.0-edit-turbo"}
+_engines: dict[str, Engine] = {}
+_engine: Engine | None = None  # the first model: text-to-image and the default for edits
 _enhancer = None
 _resolver = None
 _graphs = False
@@ -66,6 +68,10 @@ def _session(session_id: str) -> EditSession:
 
 
 def _configure(session: EditSession, body: dict) -> None:
+    name = body.get("model") or next(iter(_engines))
+    if name not in _engines:
+        raise HTTPException(400, f"model must be one of {list(_engines)}")
+    session.engine = _engines[name]
     speed = body.get("speed", "quality")
     if speed not in SPEED_PRESETS:
         raise HTTPException(400, f"speed must be one of {list(SPEED_PRESETS)}")
@@ -150,7 +156,7 @@ def create_app() -> FastAPI:
     def config():
         return {"speeds": list(SPEED_PRESETS), "attentions": list(ATTENTIONS), "aspects": ASPECTS,
                 "palette": [{"name": n, "rgb": c} for n, c in MARK_PALETTE], "enhancer": _enhancer is not None, "context": _resolver is not None, "resolutions": list(RESOLUTIONS),
-                "model": _engine.model_path}
+                "model": _engine.model_path, "models": list(_engines)}
 
     @app.post("/api/generate")
     def generate(body: dict = Body(...)):
@@ -160,8 +166,11 @@ def create_app() -> FastAPI:
         mp = RESOLUTIONS.get(body.get("resolution", "1k"), 1.0)
         width, height = _scaled(ASPECTS.get(body.get("aspect", "1:1"), (1024, 1024)), mp)
         seed = body.get("seed")
+        qwen = _engines.get("qwen")
+        if qwen is None:
+            raise HTTPException(400, "text-to-image needs Qwen; start the server with --models qwen,fibo")
         with _lock:
-            image, latent_id = _engine.text_to_image(prompt, width=width, height=height,
+            image, latent_id = qwen.text_to_image(prompt, width=width, height=height,
                                                      seed=None if seed in (None, "", -1) else int(seed))
             session = _new_session(image, root_latent_id=latent_id, megapixels=mp)
         return _describe(session, preview=True)
@@ -270,7 +279,8 @@ def create_app() -> FastAPI:
 def main():
     global _engine, _enhancer, _resolver, _graphs
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen-Image-2.1-Turbo")
+    ap.add_argument("--model", default=MODELS["qwen"], help="Qwen-Image 2.1 path or HF id")
+    ap.add_argument("--models", default="qwen", help="comma-separated, first is the default: qwen, fibo")
     ap.add_argument("--int8", action="store_true", help="alias for --quant int8")
     ap.add_argument("--quant", default="nvfp4", choices=["nvfp4", "int8", "bf16"],
                     help="DiT weights/activations: nvfp4 (flashinfer W4A4, fastest), int8 (ConvRot), bf16")
@@ -300,8 +310,17 @@ def main():
         extra.update(lora_path=args.lora, lora_merge_mode="merge" if quant != "int8" else "dynamic")
     if args.sigmas:
         SPEED_PRESETS["quality"] = [float(x) for x in args.sigmas.split(",")]
-    _engine = Engine(args.model, out_dir=args.out, **extra)
-    _engine.default_steps, _engine.default_guidance = args.steps, args.guidance
+    for name in args.models.split(","):
+        if name not in MODELS:
+            ap.error(f"--models: unknown model {name!r}, pick from {list(MODELS)}")
+        if name == "qwen":
+            engine = Engine(args.model, out_dir=args.out, **extra)
+            engine.default_steps, engine.default_guidance = args.steps, args.guidance
+        else:
+            # Fibo's prompt length changes its shapes every request, so graphs would never replay
+            engine = Engine(MODELS[name], out_dir=args.out, component_attention_backends={"transformer": "sage_attn"})
+        _engines[name] = engine
+    _engine = next(iter(_engines.values()))
     os.chdir(_engine.out_dir)
     if args.enhancer_url:
         from multi_turn.app.enhance import Enhancer
@@ -321,7 +340,8 @@ def main():
     finally:
         for session in _sessions.values():
             session.flush()
-        _engine.shutdown()
+        for engine in _engines.values():
+            engine.shutdown()
 
 
 if __name__ == "__main__":
