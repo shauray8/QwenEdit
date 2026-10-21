@@ -392,6 +392,7 @@ function summary(v) {
 }
 function show(data, { keepBoxes = false } = {}) {
   S.session = data;
+  if (S.syncModelLock) setTimeout(S.syncModelLock);
   $("empty").classList.add("dim"); $("empty").classList.remove("open"); $("newBtn").classList.remove("on"); $("frame").hidden = false; $("dock").classList.add("on");
   const head = data.versions[data.head];
   // the preview that came with the response shows at once; the full-resolution PNG follows
@@ -483,7 +484,6 @@ async function doEnhance() {
 
 // ---- start: generate / upload
 async function generate() {
-  if (S.genLocked) return;
   const prompt = $("genPrompt").value.trim(); if (!prompt) return toast("Write a prompt to generate an image.");
   const seed = $("optSeed").value;
   const target = S.session && S.sel >= 0 ? S.sel : -1;  // a selected box: the image becomes its item
@@ -581,18 +581,31 @@ document.addEventListener("keyup", (e) => { if (e.key === " " && S.compare) comp
     $("modelSeg").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x.dataset.v === m));
     $("speed").hidden = m !== "qwen";  // Fibo Turbo has one 4-step schedule
     $("fiboSteps").hidden = m === "qwen";
-    // Fibo 2.0 Edit Turbo only edits: generate is locked (not disabled, so the hover tip still shows)
-    S.genLocked = m === "fibo";
-    $("genBtn").classList.toggle("locked", S.genLocked);
-    $("genBtn").setAttribute("aria-disabled", S.genLocked);
-    $("genBtn").title = S.genLocked ? "Fibo is edit-only for now: upload a photo, or switch to Qwen to generate" : "";
+
   };
   if (S.config.models.length > 1) {
     $("model").hidden = true; $("modelSeg").hidden = false;
     $("modelSeg").innerHTML = S.config.models.map((m) => `<button data-v="${m}">${names[m] || m}</button>`).join("");
-    $("modelSeg").querySelectorAll("button").forEach((b) => b.onclick = () => pickModel(b.dataset.v));
+    $("modelSeg").querySelectorAll("button").forEach((b) => b.onclick = () => {
+      if (!b.classList.contains("locked")) pickModel(b.dataset.v);
+    });
   }
   pickModel(S.model);
+  // Fibo 2.0 Edit Turbo only edits: its picker button is locked (not disabled, so the hover tip shows) while the
+  // start screen is open, and the previous pick comes back once an image is on the canvas
+  const fiboBtn = $("modelSeg").querySelector('[data-v="fibo"]');
+  const syncModelLock = () => {
+    if (!fiboBtn || !S.config.models.includes("qwen")) return;
+    const generating = !S.session || $("empty").classList.contains("open");
+    fiboBtn.classList.toggle("locked", generating);
+    fiboBtn.setAttribute("aria-disabled", generating);
+    fiboBtn.title = generating ? "Fibo is edit-only for now" : "";
+    if (generating && S.model === "fibo") { S.resumeModel = "fibo"; pickModel("qwen"); }
+    else if (!generating && S.resumeModel) { pickModel(S.resumeModel); S.resumeModel = null; }
+  };
+  new MutationObserver(syncModelLock).observe($("empty"), { attributes: true, attributeFilter: ["class"] });
+  S.syncModelLock = syncModelLock;
+  syncModelLock();
   $("optAttn").innerHTML = S.config.attentions.map((a) => `<option value="${a}">${a === "sdpa" ? "SDPA (bf16)" : a === "sage2" ? "Sage2 (int8/fp8)" : "Sage3 (fp4)"}</option>`).join("");
   if (S.config.attentions.includes("sage2")) $("optAttn").value = "sage2";  // −10% per edit, visually identical
   $("enhanceBtn").disabled = !S.config.enhancer;
