@@ -46,9 +46,10 @@ def _ffn_forward(packed, w2):
 
 @torch.no_grad()
 def maybe_convert(model: nn.Module) -> None:
-    if not ENABLED or id(model) in _converted:
+    if not ENABLED or id(model) in _converted or hasattr(model.layers[0].attention, "qkv_fp4"):
         return
     _converted.add(id(model))
+    before = torch.cuda.memory_allocated()
     blocks = list(model.noise_refiner) + list(model.layers)
     for block in blocks:
         attn, ffn = block.attention, block.feed_forward
@@ -60,4 +61,5 @@ def maybe_convert(model: nn.Module) -> None:
         ffn.forward = _ffn_forward(ffn.gate_up_fp4, ffn.w2)
         del attn.to_q, attn.to_k, attn.to_v, ffn.w1, ffn.w3
     torch.cuda.empty_cache()
-    logger.info("multi_turn: NVFP4 W4A4 Fibo DiT: packed QKV and w1/w3, %d blocks", len(blocks))
+    logger.info("multi_turn: NVFP4 W4A4 Fibo DiT: packed QKV and w1/w3, %d blocks, %.1f -> %.1f GiB allocated",
+                len(blocks), before / 2**30, torch.cuda.memory_allocated() / 2**30)
