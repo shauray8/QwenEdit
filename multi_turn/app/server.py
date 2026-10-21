@@ -81,8 +81,8 @@ def _configure(session: EditSession, body: dict) -> None:
         raise HTTPException(400, f"attention must be one of {list(ATTENTIONS)}")
     session.attention = None if _graphs else ATTENTIONS[attention]
     steps = 4 if session.engine.family == "fibo" else len(SPEED_PRESETS[speed] or [0] * 8)
-    # 3 of 8 Qwen steps at half size; Fibo's 4-step schedule takes 1
-    session.progressive = (1 if steps == 4 and session.engine.family == "fibo" else round(3 * steps / 8)) if body.get("progressive", True) and \
+    # 3 of 8 Qwen steps at half size; Fibo always runs at its trained ~1 MP, so never
+    session.progressive = 0 if session.engine.family == "fibo" else round(3 * steps / 8) if body.get("progressive", True) and \
         session.size[0] * session.size[1] >= 2.0 * 1024 * 1024 else 0
     if "crop" in body:
         session.crop = bool(body["crop"])
@@ -282,6 +282,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODELS["qwen"], help="Qwen-Image 2.1 path or HF id")
     ap.add_argument("--models", default="qwen", help="comma-separated, first is the default: qwen, fibo")
+    ap.add_argument("--fibo-llm", default=None,
+                    help="opt-in: litellm model for Bria's VGL prompt step, e.g. openai/<vlm> with OPENAI_API_BASE "
+                         "(needs pip install bria-vgl); without it Fibo gets plain instructions")
     ap.add_argument("--int8", action="store_true", help="alias for --quant int8")
     ap.add_argument("--quant", default="nvfp4", choices=["nvfp4", "int8", "bf16"],
                     help="DiT weights/activations: nvfp4 (flashinfer W4A4, fastest), int8 (ConvRot), bf16")
@@ -320,6 +323,12 @@ def main():
         else:
             # Fibo's prompt length changes its shapes every request, so graphs would never replay
             engine = Engine(MODELS[name], out_dir=args.out, component_attention_backends={"transformer": "sage_attn"})
+            from multi_turn.fibo.vgl import VGL
+
+            if args.fibo_llm and VGL.available(args.fibo_llm):
+                engine.vgl = VGL(args.fibo_llm)
+            elif args.fibo_llm:
+                logger.warning("multi_turn: --fibo-llm needs pip install bria-vgl (and a key for a hosted model)")
         _engines[name] = engine
     _engine = next(iter(_engines.values()))
     os.chdir(_engine.out_dir)
