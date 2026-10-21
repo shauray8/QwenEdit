@@ -80,8 +80,9 @@ def _configure(session: EditSession, body: dict) -> None:
     if attention not in ATTENTIONS:
         raise HTTPException(400, f"attention must be one of {list(ATTENTIONS)}")
     session.attention = None if _graphs else ATTENTIONS[attention]
-    steps = len(SPEED_PRESETS[speed] or [0] * 8)
-    session.progressive = round(3 * steps / 8) if body.get("progressive", True) and \
+    steps = 4 if session.engine.family == "fibo" else len(SPEED_PRESETS[speed] or [0] * 8)
+    # 3 of 8 Qwen steps at half size; Fibo's 4-step schedule takes 1
+    session.progressive = (1 if steps == 4 and session.engine.family == "fibo" else round(3 * steps / 8)) if body.get("progressive", True) and \
         session.size[0] * session.size[1] >= 2.0 * 1024 * 1024 else 0
     if "crop" in body:
         session.crop = bool(body["crop"])
