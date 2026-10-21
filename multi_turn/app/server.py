@@ -92,6 +92,8 @@ def _configure(session: EditSession, body: dict) -> None:
     cap = {"full": None, "1.5k": 2.25, "1k": 1.0}.get(body.get("ref", "1.5k"))
     mp = session.size[0] * session.size[1] / (1024 * 1024)
     session.ref_scale = 1.0 if cap is None else min(1.0, cap / mp)
+    if "fibo_mask" in body:
+        session.fibo_mask = None if body["fibo_mask"] is None else bool(body["fibo_mask"])
     if "cumulative" in body:
         session.cumulative = bool(body["cumulative"])
     session.steps = int(body["steps"]) if body.get("steps") else None
