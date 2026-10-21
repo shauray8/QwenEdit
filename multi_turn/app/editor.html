@@ -151,6 +151,7 @@ aside .head h3 { margin: 0 auto 0 0; font-size: 13px; }
   <header>
     <div class="brand"><i></i>multi_turn</div>
     <span class="chip" id="model">…</span>
+    <div class="seg" id="modelSeg" hidden></div>
     <div class="seg" id="speed">
       <button data-v="quality" class="on">Quality<small>8</small></button>
       <button data-v="fast">Fast<small>5</small></button>
@@ -233,7 +234,7 @@ aside .head h3 { margin: 0 auto 0 0; font-size: 13px; }
 
 <script>
 const $ = (id) => document.getElementById(id);
-const S = { config: null, session: null, boxes: [], sel: -1, speed: "quality", busy: false, aspect: "1:1", scale: 1, compare: false };
+const S = { model: null, config: null, session: null, boxes: [], sel: -1, speed: "quality", busy: false, aspect: "1:1", scale: 1, compare: false };
 const rgb = (c) => `rgb(${c[0]},${c[1]},${c[2]})`;
 
 function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("on"); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove("on"), 4200); }
@@ -399,7 +400,7 @@ function show(data, { keepBoxes = false } = {}) {
   [...data.order].reverse().forEach((vid) => {
     const v = data.versions[vid], el = document.createElement("button");
     el.className = "ver" + (vid === data.head ? " head-v" : "");
-    const meta = [vid, v.seconds ? `${v.seconds.toFixed(2)}s` : null, v.parent && v.parent !== prevOf(data, vid) ? `from ${v.parent}` : null].filter(Boolean).join(" · ");
+    const meta = [vid, v.model === "fibo" ? "Fibo" : null, v.seconds ? `${v.seconds.toFixed(2)}s` : null, v.parent && v.parent !== prevOf(data, vid) ? `from ${v.parent}` : null].filter(Boolean).join(" · ");
     el.innerHTML = `<img loading="lazy" src="${imageUrl(vid, 160)}" alt=""><div><div class="t"></div><div class="m">${meta}</div></div>`;
     el.querySelector(".t").textContent = summary(v);
     el.onclick = () => run(() => api(`/api/sessions/${data.id}/checkout`, { version: vid }), null);
@@ -447,7 +448,7 @@ async function run(fn, label = "Editing") {
 }
 function common() {
   const seed = $("optSeed").value;
-  return { speed: S.speed, progressive: $("optProg").checked, ref: $("optRef").value, context: $("optContext").checked, crop: $("optCrop").checked, attention: $("optAttn").value, feather: +$("optFeather").value, seed: seed === "" ? null : +seed };
+  return { model: S.model, speed: S.speed, progressive: $("optProg").checked, ref: $("optRef").value, context: $("optContext").checked, crop: $("optCrop").checked, attention: $("optAttn").value, feather: +$("optFeather").value, seed: seed === "" ? null : +seed };
 }
 async function doEdit() {
   if (!S.session) return;
@@ -564,6 +565,19 @@ document.addEventListener("keyup", (e) => { if (e.key === " " && S.compare) comp
 (async () => {
   S.config = await api("/api/config");
   $("model").textContent = S.config.model.split("/").pop();
+  S.model = S.config.models[0];
+  const names = { qwen: "Qwen 2.1", fibo: "Fibo 2.0" };
+  const pickModel = (m) => {
+    S.model = m;
+    $("modelSeg").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x.dataset.v === m));
+    $("speed").hidden = m !== "qwen";  // Fibo Turbo has one 4-step schedule
+  };
+  if (S.config.models.length > 1) {
+    $("model").hidden = true; $("modelSeg").hidden = false;
+    $("modelSeg").innerHTML = S.config.models.map((m) => `<button data-v="${m}">${names[m] || m}</button>`).join("");
+    $("modelSeg").querySelectorAll("button").forEach((b) => b.onclick = () => pickModel(b.dataset.v));
+  }
+  pickModel(S.model);
   $("optAttn").innerHTML = S.config.attentions.map((a) => `<option value="${a}">${a === "sdpa" ? "SDPA (bf16)" : a === "sage2" ? "Sage2 (int8/fp8)" : "Sage3 (fp4)"}</option>`).join("");
   if (S.config.attentions.includes("sage2")) $("optAttn").value = "sage2";  // −10% per edit, visually identical
   $("enhanceBtn").disabled = !S.config.enhancer;
