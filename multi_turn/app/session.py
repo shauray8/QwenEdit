@@ -35,6 +35,7 @@ OBJECT_CLAUSE = ("use the exact item shown in <image{n}>, keeping its shape, pro
                  "sized so it fills the box, and blend it into the scene with matching perspective, lighting, contact shadows and reflections")
 REGION_TEMPLATE = "{regions}{instruction} Remove all colored box outlines completely and keep everything outside the boxes unchanged."
 
+FIBO_FEATHER_PX = 12.0
 FIBO_ORDINALS = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"]
 
 ANCHOR_TEMPLATE = (
@@ -634,13 +635,16 @@ class EditSession:
             refs, canvas_ref, template = [base], 0, "{instruction}"
             # Fibo's masked-edit captions name the greyed area "the masked region(s)", as Bria's VGL rewriter does
             task = instruction
+            def place(text):
+                return re.sub(r"\s+(here|there|in (this|the) (box|area|region))$", "", text.strip().rstrip(" ."), flags=re.I)
+
             if regions and len(regions) == 1:
-                task = f"{regions[0][1].strip().rstrip('.')} in the masked region." + (f" {instruction}" if instruction else "")
+                task = f"{place(regions[0][1])} in the masked region." + (f" {instruction}" if instruction else "")
             elif regions:
-                task = " ".join(f"In the {FIBO_ORDINALS[i]} masked region: {t.strip().rstrip('.')}."
+                task = " ".join(f"In the {FIBO_ORDINALS[i]} masked region: {place(t)}."
                                 for i, (_, t) in enumerate(regions)) + (f" {instruction}" if instruction else "")
             elif boxes and instruction:
-                task = f"{instruction.rstrip(' .')} in the masked region{'s' if len(boxes) > 1 else ''}."
+                task = f"{place(instruction)} in the masked region{'s' if len(boxes) > 1 else ''}."
             if object_paths:
                 task += " " + " ".join(f"Use the item shown in image_{object_index[i]}." for i in sorted(object_index))
         if raw_prompt:
@@ -671,7 +675,8 @@ class EditSession:
                 mt["mask"]["colors"] = [list(c) for c in colors]
         seed = int(time.time_ns() % (2**31)) if seed is None else seed
         source = self._image_cache.get(base.id) or Image.open(self.path(base.id))
-        window = self.crop_rect(boxes) if boxes and self.crop else None
+        # Fibo regenerates only its greyed mask, so a box edit keeps the full frame at its trained size
+        window = self.crop_rect(boxes) if boxes and self.crop and not fibo else None
 
         start = time.perf_counter()
         if window is None:
@@ -682,7 +687,10 @@ class EditSession:
             )
             generated = time.perf_counter()
             out = out.convert(source.mode)
-            if boxes and self.paste_back:
+            if boxes and self.paste_back and fibo:
+                # the box is new content end to end: no re-render revert or tone match, just a short outward feather
+                out = Image.composite(out, source, pixel_mask(self.size, boxes, FIBO_FEATHER_PX, 0.0))
+            elif boxes and self.paste_back:
                 out = blend_box_edit(out, source, boxes, feather_px, grow_px)
             # unboxed edits stay whole: glow, shadows and reflections would not survive a change mask
         else:
