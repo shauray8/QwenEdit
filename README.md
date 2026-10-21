@@ -7,6 +7,7 @@ https://github.com/user-attachments/assets/bb136139-1d88-4300-8d26-4bbef5d2a13c
 
 
 Edit latency on an RTX PRO 6000 (NVFP4, 8 steps): 1K full image 0.9 s, 2K full image 4.4 s, 2K box edit 3.9–5.2 s, small box 0.4–1 s.
+Fibo 2.0 Edit Turbo (NVFP4, 4 steps): 1K full image 1.4–2.2 s, box edit 0.4–1.2 s, 2K full image 10.5 s.
 
 
 ## Install
@@ -23,7 +24,13 @@ make setup
 ```
 python -m multi_turn.app.server            # http://127.0.0.1:8000
 python -m multi_turn.app.server --share    # plus a public *.gradio.live link
+python -m multi_turn.app.server --models qwen,fibo   # both models, picked per edit in the editor
 ```
+
+Fibo 2.0 Edit Turbo (`briaai/Fibo-2.0-edit-turbo`) is gated on Hugging Face (`hf auth login` first) and CC BY-NC.
+Both models on one 96 GB GPU need smaller Qwen caches:
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MULTI_TURN_KV_GPU_GIB=6 MULTI_TURN_ENC_GPU_GIB=2`.
+Fibo was trained around 1 MP; at 2K it tends to recompose the scene.
 
 Optional helpers, each on its own:
 
@@ -36,7 +43,8 @@ make enhancer   # prompt enhancer       -> --enhancer-url http://127.0.0.1:30000
 
 | Flag | Default | |
 |---|---|---|
-| `--model` | `Qwen/Qwen-Image-2.1-Turbo` | model path or HF id |
+| `--model` | `Qwen/Qwen-Image-2.1-Turbo` | Qwen model path or HF id |
+| `--models` | `qwen` | comma-separated `qwen`, `fibo`; the first is the default |
 | `--quant` | `nvfp4` | `nvfp4`, `int8` or `bf16` DiT |
 | `--int8` | | same as `--quant int8` |
 | `--host` / `--port` | `127.0.0.1` / `8000` | |
