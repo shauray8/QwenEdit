@@ -85,6 +85,7 @@ class Engine:
         self.model_path = model_path
         # Fibo has no stored latents, prefix cache or box marks; a box edit greys the box out instead
         self.family = "fibo" if "fibo" in model_path.lower() else "qwen"
+        self.vgl = None  # Fibo: Bria's VGL prompt rewriter (multi_turn.fibo.vgl.VGL), set by the server
         self.default_steps = None
         self.default_guidance = None
         self.attention = attention
@@ -122,7 +123,16 @@ class Engine:
             output_file_name=name,
             diffusers_kwargs={"mt": mt},
         )
+        run_size = (width, height)
         if self.family == "fibo":
+            from multi_turn.fibo.pipeline import trained_size
+
+            # Bria's practice: edit at the trained size for the aspect ratio (~1 MP), the result resized back
+            run_size = trained_size(width, height)
+            kwargs["width"], kwargs["height"] = run_size
+            if run_size != (width, height):
+                for key in ("store_output_as", "ref_latents", "ref_latent_crops", "compose"):
+                    mt = {k: v for k, v in mt.items() if k != key}
             fibo = {"mask_boxes": (mt.get("mask") or {}).get("boxes"), "store_output_as": mt.get("store_output_as"),
                     "ref_latent": (mt.get("ref_latents") or {}).get(0), "progressive": mt.get("progressive"),
                     "ref_latent_crop": (mt.get("ref_latent_crops") or {}).get(0), "compose": mt.get("compose")}
@@ -141,9 +151,10 @@ class Engine:
         result = result[0] if isinstance(result, list) else result
         if result is None:
             raise RuntimeError("generation failed")
-        if save:
-            return Image.open(result.output_file_path), result
-        return _to_pil(result), result
+        image = Image.open(result.output_file_path) if save else _to_pil(result)
+        if image.size != (width, height):
+            image = image.resize((width, height), Image.Resampling.LANCZOS)
+        return image, result
 
     def text_to_image(self, prompt, *, width=1024, height=1024, seed=None, steps=None):
         seed = int(time.time_ns() % (2**31)) if seed is None else seed
@@ -686,6 +697,23 @@ class EditSession:
             # the full frame below
             window = self.crop_rect(boxes, min_px=FIBO_CROP_PX, max_frac=0.7)
 
+        vgl_seconds = None
+        if fibo and self.engine.vgl is not None and not raw_prompt:
+            # Bria's prompt step: the LLM sees what Fibo will (the crop and its local boxes) and writes the result's
+            # caption with an instruction phrased for the mask
+            plain = "; ".join(t for _, t in regions) if regions else instruction
+            if regions and instruction:
+                plain += f". {instruction}"
+            if window is None:
+                vgl_image, vgl_boxes = source, boxes
+            else:
+                x0, y0 = window[:2]
+                vgl_image = source.crop(window)
+                vgl_boxes = [(a - x0, b - y0, c - x0, d - y0) for a, b, c, d in boxes]
+            objects_images = [Image.open(p) for p in object_paths]
+            vgl_prompt, vgl_seconds = self.engine.vgl.rewrite(plain, [vgl_image, *objects_images], vgl_boxes, seed=seed)
+            if vgl_prompt:
+                task = prompt = vgl_prompt
         start = time.perf_counter()
         if window is None:
             out, result = self.engine.run(
@@ -711,9 +739,9 @@ class EditSession:
         path = os.path.join(self.dir, f"{vid}.png")
         self._image_cache[vid] = out
         self._saves[vid] = self._io.submit(out.save, path, compress_level=1)
-        seconds = time.perf_counter() - start
+        seconds = time.perf_counter() - start + (vgl_seconds or 0.0)
         timings = dict(generate=generated - start, post=posted - generated, save=time.perf_counter() - posted,
-                       crop=list(window) if window else None)
+                       crop=list(window) if window else None, vgl=vgl_seconds)
 
         change_box = change_mask(out, source, box_only=True)[1] if self.paste_back else None
         version = Version(
