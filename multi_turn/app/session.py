@@ -36,6 +36,8 @@ OBJECT_CLAUSE = ("use the exact item shown in <image{n}>, keeping its shape, pro
 REGION_TEMPLATE = "{regions}{instruction} Remove all colored box outlines completely and keep everything outside the boxes unchanged."
 
 FIBO_FEATHER_PX = 12.0
+FIBO_CROP_PX = 1024
+FIBO_CROP_ABOVE = 1.5 * 1024 * 1024
 FIBO_ORDINALS = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"]
 
 ANCHOR_TEMPLATE = (
@@ -505,15 +507,18 @@ class EditSession:
         return out[::-1]
 
 
-    def crop_rect(self, boxes: list[Box]) -> tuple[int, int, int, int] | None:
+    def crop_rect(self, boxes: list[Box], min_px: int | None = None,
+                  max_frac: float | None = None) -> tuple[int, int, int, int] | None:
         W, H = self.size
+        min_px = self.crop_min_px if min_px is None else min_px
+        max_frac = self.crop_max_frac if max_frac is None else max_frac
         ux0, uy0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
         ux1, uy1 = max(b[2] for b in boxes), max(b[3] for b in boxes)
         margin = max(self.crop_margin_px, 0.35 * max(ux1 - ux0, uy1 - uy0))
 
         def span(lo, hi, limit):
             lo, hi = max(0.0, lo - margin), min(float(limit), hi + margin)
-            need = min(max(self.crop_min_px, hi - lo), limit)
+            need = min(max(min_px, hi - lo), limit)
             grow = need - (hi - lo)
             lo, hi = lo - grow / 2, hi + grow / 2
             if lo < 0:
@@ -527,7 +532,7 @@ class EditSession:
 
         x0, x1 = span(ux0, ux1, W)
         y0, y1 = span(uy0, uy1, H)
-        if (x1 - x0) * (y1 - y0) > self.crop_max_frac * W * H:
+        if (x1 - x0) * (y1 - y0) > max_frac * W * H:
             return None
         return x0, y0, x1, y1
 
@@ -675,8 +680,11 @@ class EditSession:
                 mt["mask"]["colors"] = [list(c) for c in colors]
         seed = int(time.time_ns() % (2**31)) if seed is None else seed
         source = self._image_cache.get(base.id) or Image.open(self.path(base.id))
-        # Fibo regenerates only its greyed mask, so a box edit keeps the full frame at its trained size
         window = self.crop_rect(boxes) if boxes and self.crop and not fibo else None
+        if boxes and self.crop and fibo and self.size[0] * self.size[1] > FIBO_CROP_ABOVE:
+            # Fibo regenerates only its greyed mask and wants ~1 MP: a 1024 px window around the box above 1.5 MP,
+            # the full frame below
+            window = self.crop_rect(boxes, min_px=FIBO_CROP_PX, max_frac=0.7)
 
         start = time.perf_counter()
         if window is None:
@@ -758,7 +766,12 @@ class EditSession:
         out = out.convert(source.mode)
         if os.environ.get("MULTI_TURN_SAVE_RAW"):
             out.save(os.path.join(self.dir, f"{vid}_raw.png"), compress_level=1)
-        patch = blend_box_edit(out, crop_image, local, feather_px, grow_px) if self.paste_back else out
+        if self.paste_back and self.engine.family == "fibo":
+            patch = Image.composite(out, crop_image, pixel_mask(crop_image.size, local, FIBO_FEATHER_PX, 0.0))
+        elif self.paste_back:
+            patch = blend_box_edit(out, crop_image, local, feather_px, grow_px)
+        else:
+            patch = out
         full = source.copy()
         full.paste(patch, (x0, y0))
         return full, result, latent_id
