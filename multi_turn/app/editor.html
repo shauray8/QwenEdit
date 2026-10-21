@@ -579,6 +579,10 @@ document.addEventListener("keyup", (e) => { if (e.key === " " && S.compare) comp
     $("modelSeg").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x.dataset.v === m));
     $("speed").hidden = m !== "qwen";  // Fibo Turbo has one 4-step schedule
     $("fiboSteps").hidden = m === "qwen";
+    // Fibo 2.0 Edit only edits; new images always come from Qwen
+    const viaQwen = m !== "qwen" && S.config.models.includes("qwen");
+    $("genBtn").textContent = viaQwen ? "Generate with Qwen" : "Generate";
+    $("genBtn").title = viaQwen ? "Fibo 2.0 Edit Turbo is an edit model; text-to-image runs on Qwen-Image 2.1" : "";
   };
   if (S.config.models.length > 1) {
     $("model").hidden = true; $("modelSeg").hidden = false;
