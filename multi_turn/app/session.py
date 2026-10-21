@@ -36,6 +36,29 @@ OBJECT_CLAUSE = ("use the exact item shown in <image{n}>, keeping its shape, pro
 REGION_TEMPLATE = "{regions}{instruction} Remove all colored box outlines completely and keep everything outside the boxes unchanged."
 
 FIBO_FEATHER_PX = 12.0
+
+
+def fibo_where(box, size) -> str:
+    """A box's place in words: "top left", "center", "bottom right", ..."""
+    cx, cy = (box[0] + box[2]) / 2 / size[0], (box[1] + box[3]) / 2 / size[1]
+    col = "left" if cx < 0.36 else "right" if cx > 0.64 else ""
+    row = "top" if cy < 0.36 else "bottom" if cy > 0.64 else ""
+    return " ".join(w for w in (row, col) if w) or "center"
+
+
+def fibo_box_kind(text: str) -> tuple[str, str]:
+    """``(kind, phrase)`` for a Fibo box edit. Adds, replacements and removals inpaint the greyed box, phrased the way
+    Bria's VGL rewriter names it ({region} is "the masked region"); anything else changes what is already in the box
+    ("modify"), which the mask would hide."""
+    t = re.sub(r"\s+(here|there|in (this|the) (box|area|region))$", "", text.strip().rstrip(" ."), flags=re.I)
+    if re.match(r"(remove|erase|delete|get rid of|take out|clear)\b", t, re.I):
+        return "remove", "Fill {region} with background that matches its surroundings, with nothing in it."
+    m = re.match(r"(?:replace|swap)\s+.+?\s+(?:with|for)\s+(.+)$", t, re.I)
+    if m:
+        return "replace", f"Put {m.group(1)} in {{region}}."
+    if re.match(r"(add|put|place|insert|draw|create|generate|fill|include|paint)\b", t, re.I):
+        return "add", f"{t} in {{region}}."
+    return "modify", t + "."
 FIBO_CROP_PX = 1024
 FIBO_CROP_ABOVE = 1.5 * 1024 * 1024
 FIBO_ORDINALS = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"]
@@ -408,6 +431,7 @@ class EditSession:
         self.attention: str | None = None
         self.resolver = None
         self.cumulative = True
+        self.fibo_mask = None  # Fibo box edits: None picks per instruction, True greys the box, False pastes a full edit
         self.crop, self.crop_margin_px, self.crop_min_px, self.crop_max_frac = crop, crop_margin_px, crop_min_px, crop_max_frac
         self._io = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"multi_turn-{session_id or 'io'}")
         self._saves: dict[str, Future] = {}
@@ -647,20 +671,27 @@ class EditSession:
         else:
             task = instruction
         fibo = self.engine.family == "fibo"
+        fibo_unmasked = False
         if fibo:
             refs, canvas_ref, template = [base], 0, "{instruction}"
-            # Fibo's masked-edit captions name the greyed area "the masked region(s)", as Bria's VGL rewriter does
             task = instruction
-            def place(text):
-                return re.sub(r"\s+(here|there|in (this|the) (box|area|region))$", "", text.strip().rstrip(" ."), flags=re.I)
-
-            if regions and len(regions) == 1:
-                task = f"{place(regions[0][1])} in the masked region." + (f" {instruction}" if instruction else "")
-            elif regions:
-                task = " ".join(f"In the {FIBO_ORDINALS[i]} masked region: {place(t)}."
-                                for i, (_, t) in enumerate(regions)) + (f" {instruction}" if instruction else "")
-            elif boxes and instruction:
-                task = f"{place(instruction)} in the masked region{'s' if len(boxes) > 1 else ''}."
+            texts = [t for _, t in regions] if regions else ([instruction] if boxes and instruction else [])
+            if texts:
+                kinds = [fibo_box_kind(t) for t in texts]
+                # Fibo's mask is inpainting: it hides the box, so changing what is already there needs the full frame
+                masked = any(k != "modify" for k, _ in kinds) if self.fibo_mask is None else self.fibo_mask
+                fibo_unmasked = not masked
+                if not masked:
+                    # unmasked, Fibo does not see the box: say where it is so the right object changes
+                    where = [fibo_where(b, self.size) for b in (boxes or [b for b, _ in regions])]
+                    task = " ".join(f"{t.strip().rstrip('.')}, the one in the {w} of the image." for t, w in zip(texts, where))
+                    task += " Keep everything else unchanged."
+                elif len(texts) == 1:
+                    task = kinds[0][1].format(region="the masked region" + ("s" if len(boxes or []) > 1 else ""))
+                else:
+                    task = " ".join(k[1].format(region=f"the {FIBO_ORDINALS[i]} masked region") for i, k in enumerate(kinds))
+                if regions and instruction:
+                    task += f" {instruction}"
             if object_paths:
                 task += " " + " ".join(f"Use the item shown in image_{object_index[i]}." for i in sorted(object_index))
         if raw_prompt:
@@ -682,7 +713,7 @@ class EditSession:
             mt["ref_scales"] = {len(refs) + k: scale for k in range(len(object_paths))}
         if self.passthrough:
             mt["ref_latents"] = {i: r.latent_id for i, r in enumerate(refs) if self._latent(r)}
-        if boxes:
+        if boxes and not (fibo and fibo_unmasked):
             mt["mask"] = {
                 "boxes": [list(b) for b in boxes], "canvas_ref": canvas_ref, "feather_px": feather_px,
                 "grow_px": grow_px, "annotate": self.mark_boxes or bool(regions), "lock_sigma": LOCK_SIGMA,
