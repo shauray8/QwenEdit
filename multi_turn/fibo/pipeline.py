@@ -14,7 +14,9 @@ Per-request options in ``diffusers_kwargs={"fibo": {...}}``:
 from __future__ import annotations
 
 import json
+import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import ClassVar
 
@@ -39,6 +41,7 @@ from sglang.multimodal_gen.runtime.utils.vision import load_image
 
 from multi_turn.fibo.dit import FiboDitConfig
 
+logger = logging.getLogger(__name__)
 MODEL_PATHS = ["briaai/Fibo-2.0-edit-turbo"]
 PROMPT_TEMPLATE = "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
 VISION_MARKER = "<|vision_start|><|image_pad|><|vision_end|>"
@@ -273,6 +276,9 @@ class FiboDenoisingStage(DenoisingStage):
 
     def _run_denoising_step(self, ctx, step, batch, server_args):
         steps = batch.extra.get("fibo_progressive", 0)
+        if step.step_index == 0 and os.environ.get("MULTI_TURN_DEBUG") == "1":
+            logger.info("multi_turn: fibo %dx%d sigmas %s", batch.width, batch.height,
+                        [round(float(x), 4) for x in ctx.scheduler.sigmas])
         if step.step_index >= steps:
             return super()._run_denoising_step(ctx, step, batch, server_args)
         # as Qwen's progressive path: half-size target first, then upsample x0 and re-noise with the same noise
