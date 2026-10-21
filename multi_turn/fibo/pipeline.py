@@ -175,9 +175,10 @@ class FiboInputValidationStage(InputValidationStage):
 
 
 class FiboEncodingStage(PipelineStage):
-    def __init__(self, text_encoder, processor, vae, scheduler):
+    def __init__(self, text_encoder, processor, vae, scheduler, transformer):
         super().__init__()
         self.text_encoder, self.processor, self.vae, self.scheduler = text_encoder, processor, vae, scheduler
+        self.transformer = transformer
 
     def component_uses(self, server_args, stage_name=None):
         name = self._component_stage_name(stage_name)
@@ -207,6 +208,10 @@ class FiboEncodingStage(PipelineStage):
         return torch.cat(tokens, dim=1), hw
 
     def forward(self, batch, server_args):
+        from multi_turn.fibo.fp4 import maybe_convert
+
+        # before the first VAE encode, so the BF16 DiT is gone by the time a 2K encode needs the room
+        maybe_convert(self.transformer)
         config = server_args.pipeline_config
         device = get_local_torch_device()
         images = batch.condition_image
@@ -313,7 +318,8 @@ class FiboPipeline(LoRAPipeline, ComposedPipelineBase):
     def create_pipeline_stages(self, server_args):
         self.add_stage(FiboInputValidationStage())
         self.add_stage(FiboEncodingStage(self.get_module("text_encoder"), self.get_module("processor"),
-                                         self.get_module("vae"), self.get_module("scheduler")))
+                                         self.get_module("vae"), self.get_module("scheduler"),
+                                         self.get_module("transformer")))
         self.add_standard_latent_preparation_stage()
         self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_fibo_mu])
         self.add_stage(FiboDenoisingStage(transformer=self.get_module("transformer"),
