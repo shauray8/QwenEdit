@@ -13,6 +13,7 @@ Per-request options in ``diffusers_kwargs={"fibo": {...}}``:
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import math
@@ -51,12 +52,79 @@ TEXT_ENCODER_IMAGE_SIZE = 768
 DEFAULT_AREA = 1024 * 1024
 
 
-def edit_prompt(instruction: str, num_images: int) -> str:
-    """A plain instruction in the JSON form Fibo 2.0 was trained with (no structured caption)."""
+def parse_prompt(prompt: str):
+    """``(caption, instruction)`` as Bria's pipeline reads a prompt: a VGL JSON object (``bria_vgl.vgl_json``) or plain
+    text. Empty values and scores are dropped, as training did."""
+    try:
+        caption = json.loads(prompt)
+    except json.JSONDecodeError:
+        return prompt, None
+    if not isinstance(caption, dict):
+        return prompt, None
+    instruction = caption.pop("edit_instruction", None)
+    if "structured_caption" in caption:
+        caption = caption.pop("structured_caption")
+        if not isinstance(caption, dict):
+            return caption or None, instruction
+
+    def empty(value):
+        if isinstance(value, float):
+            return math.isnan(value)
+        return value is None or (isinstance(value, (str, dict, list)) and not value)
+
+    def clean(value):
+        if isinstance(value, dict):
+            value = {k: clean(v) for k, v in value.items()}
+            return {k: v for k, v in value.items() if not empty(v)}
+        if isinstance(value, list):
+            return [v for v in map(clean, value) if not empty(v)]
+        return value
+
+    keys = set(caption)
+    scores = ("aesthetic_score", "preference_score")
+    caption = {
+        key: {k: v for k, v in value.items() if k not in scores} if isinstance(value, dict) else value
+        for key, value in clean(caption).items()
+        if key not in scores
+    }
+    caption = {key: value for key, value in caption.items() if value != {}}
+    if keys == {"short_description", "text_render"}:
+        caption = {"short_description": caption.get("short_description") or "",
+                   "text_render": caption.get("text_render") or []}
+    return caption or None, instruction
+
+
+def text_entries(caption) -> list[str]:
+    entries = (caption.get("text_render") or []) if isinstance(caption, dict) else []
+    return [e["text"] for e in entries if isinstance(e, dict) and isinstance(e.get("text"), str) and e["text"]]
+
+
+def edit_prompt(prompt: str, num_images: int, text_images: bool = False) -> str:
+    """The edit prompt Fibo 2.0 was trained with: a vision marker per image, the result's caption when the prompt has
+    one, then the instruction; with text images, each text entry gets the marker of its image (as Bria's pipeline)."""
+    caption, instruction = parse_prompt(prompt)
+    if instruction is None:
+        caption, instruction = None, prompt
+    if text_images and isinstance(caption, dict):
+        for entry in caption.get("text_render") or []:
+            if isinstance(entry, dict) and isinstance(entry.get("text"), str) and entry["text"]:
+                entry["image_tokens"] = VISION_MARKER
     edit = {"image": VISION_MARKER} if num_images == 1 else {
         f"image_{k}": VISION_MARKER for k in range(1, num_images + 1)}
+    if caption:
+        edit["structured_caption"] = caption
     edit["edit_instruction"] = instruction
     return json.dumps(edit, separators=(",", ":"), ensure_ascii=False)
+
+
+@functools.lru_cache(maxsize=1)
+def fallback_fonts():
+    from huggingface_hub import snapshot_download
+
+    from multi_turn.fibo.text_images import load_font
+
+    root = snapshot_download(MODEL_PATHS[0], allow_patterns=["fonts/*"])
+    return [load_font(os.path.join(root, "fonts", f)) for f in ("Aileron-Regular.otf", "DejaVuSans.ttf")]
 
 
 def grey_out(image: Image.Image, boxes) -> Image.Image:
@@ -184,9 +252,15 @@ class FiboEncodingStage(PipelineStage):
         name = self._component_stage_name(stage_name)
         return [ComponentUse(name, "text_encoder"), ComponentUse(name, "vae", target_dtype=torch.bfloat16)]
 
-    def encode_prompt(self, instruction, images, device):
-        text = PROMPT_TEMPLATE.format(edit_prompt(instruction, len(images)) if images else instruction)
-        inputs = self.processor(text=[text], images=images or None, return_tensors="pt").to(device)
+    def encode_prompt(self, prompt, images, device):
+        from multi_turn.fibo.text_images import draw_text_image
+
+        # text_render entries are shown to Qwen3-VL as drawn images after the images to edit, at every edit step
+        texts = text_entries(parse_prompt(prompt)[0])
+        text_images = [draw_text_image(t, fallback_fonts()) for t in texts]
+        body = edit_prompt(prompt, len(images), bool(text_images)) if images else prompt
+        inputs = self.processor(text=[PROMPT_TEMPLATE.format(body)], images=(images + text_images) or None,
+                                max_length=4096, truncation=True, return_tensors="pt").to(device)
         with self.use_declared_component(component_name="text_encoder", module=self.text_encoder) as encoder:
             hidden = encoder(**inputs, output_hidden_states=True, use_cache=False, logits_to_keep=1).hidden_states
         normalized = {}
