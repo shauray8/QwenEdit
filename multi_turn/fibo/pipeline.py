@@ -238,7 +238,11 @@ def prepare_fibo_mu(batch, server_args):
 
 
 class FiboDenoisingStage(DenoisingStage):
-    pass
+    def _predict_noise(self, current_model, latent_model_input, timestep, target_dtype, guidance, **kwargs):
+        from multi_turn.fibo.fp4 import maybe_convert
+
+        maybe_convert(current_model)
+        return super()._predict_noise(current_model, latent_model_input, timestep, target_dtype, guidance, **kwargs)
 
 
 class FiboPipeline(LoRAPipeline, ComposedPipelineBase):
