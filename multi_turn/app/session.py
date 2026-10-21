@@ -35,6 +35,8 @@ OBJECT_CLAUSE = ("use the exact item shown in <image{n}>, keeping its shape, pro
                  "sized so it fills the box, and blend it into the scene with matching perspective, lighting, contact shadows and reflections")
 REGION_TEMPLATE = "{regions}{instruction} Remove all colored box outlines completely and keep everything outside the boxes unchanged."
 
+FIBO_ORDINALS = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"]
+
 ANCHOR_TEMPLATE = (
     "<image1> is the original image and <image2> is its current edited version. "
     "Edit <image2>: {instruction} Keep everything else in <image2> unchanged."
@@ -630,9 +632,15 @@ class EditSession:
         fibo = self.engine.family == "fibo"
         if fibo:
             refs, canvas_ref, template = [base], 0, "{instruction}"
+            # Fibo's masked-edit captions name the greyed area "the masked region(s)", as Bria's VGL rewriter does
             task = instruction
-            if regions:
-                task = " ".join(f"{t.strip().rstrip('.')}." for _, t in regions) + (f" {instruction}" if instruction else "")
+            if regions and len(regions) == 1:
+                task = f"{regions[0][1].strip().rstrip('.')} in the masked region." + (f" {instruction}" if instruction else "")
+            elif regions:
+                task = " ".join(f"In the {FIBO_ORDINALS[i]} masked region: {t.strip().rstrip('.')}."
+                                for i, (_, t) in enumerate(regions)) + (f" {instruction}" if instruction else "")
+            elif boxes and instruction:
+                task = f"{instruction.rstrip(' .')} in the masked region{'s' if len(boxes) > 1 else ''}."
             if object_paths:
                 task += " " + " ".join(f"Use the item shown in image_{object_index[i]}." for i in sorted(object_index))
         if raw_prompt:
