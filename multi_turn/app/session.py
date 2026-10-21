@@ -63,6 +63,7 @@ class Version:
     standalone: bool = False
     objects: dict | None = None
     model: str | None = None
+    latent_models: list[str] = field(default_factory=list)  # workers holding latent_id
     children: list[str] = field(default_factory=list)
 
 
@@ -117,8 +118,10 @@ class Engine:
             diffusers_kwargs={"mt": mt},
         )
         if self.family == "fibo":
-            boxes = (mt.get("mask") or {}).get("boxes")
-            kwargs["diffusers_kwargs"] = {"fibo": {"mask_boxes": boxes} if boxes else {}}
+            fibo = {"mask_boxes": (mt.get("mask") or {}).get("boxes"), "store_output_as": mt.get("store_output_as"),
+                    "ref_latent": (mt.get("ref_latents") or {}).get(0), "progressive": mt.get("progressive"),
+                    "ref_latent_crop": (mt.get("ref_latent_crops") or {}).get(0), "compose": mt.get("compose")}
+            kwargs["diffusers_kwargs"] = {"fibo": {k: v for k, v in fibo.items() if v}}
         steps = steps if steps is not None else self.default_steps
         guidance_scale = guidance_scale if guidance_scale is not None else self.default_guidance
         if steps is not None:
@@ -410,7 +413,8 @@ class EditSession:
         self._image_cache = {"v000": root}
         native = root_latent_id if image.size == tuple(size) else None
         self.versions: dict[str, Version] = {
-            "v000": Version(id="v000", parent=None, image_path=path, latent_id=native)
+            "v000": Version(id="v000", parent=None, image_path=path, latent_id=native, model="qwen" if native else None,
+                            latent_models=["qwen"] if native else [])
         }
         self.root = self.head = "v000"
         self._counter = 0
@@ -440,6 +444,10 @@ class EditSession:
         if self._warm is not None:
             self._warm.result()
 
+    def _latent(self, version: "Version") -> str | None:
+        # stored latents live in the worker of the model that made them
+        return version.latent_id if version.latent_id and self.engine.family in version.latent_models else None
+
     def _refs(self, parent: "Version") -> list["Version"]:
         if self.layout == "anchor" and parent.id != self.root:
             return [self.versions[self.root], parent]
@@ -454,8 +462,8 @@ class EditSession:
         template = self.template if len(refs) == 2 else "{instruction}"
         mt = {"prefill_only": True, "prefix_cache": True}
         if self.passthrough:
-            mt["ref_latents"] = {i: r.latent_id for i, r in enumerate(refs) if r.latent_id}
-            missing = {i: f"{self.id}/{r.id}" for i, r in enumerate(refs) if not r.latent_id}
+            mt["ref_latents"] = {i: r.latent_id for i, r in enumerate(refs) if self._latent(r)}
+            missing = {i: f"{self.id}/{r.id}" for i, r in enumerate(refs) if not self._latent(r)}
             if missing:
                 mt["store_ref_as"] = missing
 
@@ -467,6 +475,8 @@ class EditSession:
             )
             for i, name in mt.get("store_ref_as", {}).items():
                 refs[i].latent_id = name
+                if engine.family not in refs[i].latent_models:
+                    refs[i].latent_models.append(engine.family)
 
         if not background:
             return run()
@@ -643,7 +653,7 @@ class EditSession:
             scale = min(1.0, OBJECT_REF_PIXELS / (self.size[0] * self.size[1]))
             mt["ref_scales"] = {len(refs) + k: scale for k in range(len(object_paths))}
         if self.passthrough:
-            mt["ref_latents"] = {i: r.latent_id for i, r in enumerate(refs) if r.latent_id}
+            mt["ref_latents"] = {i: r.latent_id for i, r in enumerate(refs) if self._latent(r)}
         if boxes:
             mt["mask"] = {
                 "boxes": [list(b) for b in boxes], "canvas_ref": canvas_ref, "feather_px": feather_px,
@@ -655,8 +665,6 @@ class EditSession:
         source = self._image_cache.get(base.id) or Image.open(self.path(base.id))
         window = self.crop_rect(boxes) if boxes and self.crop else None
 
-        if fibo:
-            latent_id = None
         start = time.perf_counter()
         if window is None:
             out, result = self.engine.run(
@@ -691,7 +699,7 @@ class EditSession:
             change_box=change_box, request=request or None, base=base.id,
             standalone=bool(request) and not boxes and not regions and merged is None,
             objects={i: object_paths[object_index[i] - len(refs) - 1] for i in object_index} or None,
-            model=self.engine.family,
+            model=self.engine.family, latent_models=[self.engine.family] if latent_id else [],
         )
         self.versions[vid] = version
         parent.children.append(vid)
@@ -720,7 +728,7 @@ class EditSession:
         if object_paths:
             scale = min(1.0, OBJECT_REF_PIXELS / ((x1 - x0) * (y1 - y0)))
             mt["ref_scales"] = {1 + k: scale for k in range(len(object_paths))}
-        if self.passthrough and parent.latent_id and self.engine.family == "qwen":
+        if self.passthrough and self._latent(parent):
             mt["ref_latents"] = {0: parent.latent_id}
             mt["ref_latent_crops"] = {0: cells}
             mt["compose"] = {"base": parent.latent_id, "box": cells, "as": latent_id}
