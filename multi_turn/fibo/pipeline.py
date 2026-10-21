@@ -2,8 +2,13 @@
 
 Latents live as FLUX.2 packs them (2x2 patches, 128 channels, BatchNorm-normalized), which is also the token layout
 Fibo's DiT embeds, so SGLang's FLUX.2 decode path is reused unchanged.
-Per-request options: ``diffusers_kwargs={"fibo": {"mask_boxes": [[x0, y0, x1, y1], ...]}}`` in source pixels greys
-those regions out, Fibo's masked edit.
+Per-request options in ``diffusers_kwargs={"fibo": {...}}``:
+  mask_boxes       [[x0, y0, x1, y1], ...] in source pixels, greyed out (Fibo's masked edit)
+  store_output_as  keep the output tokens under this id
+  ref_latent       use stored tokens as the image to edit instead of VAE-encoding it (ignored with mask_boxes)
+  ref_latent_crop  [x0, y0, x1, y1] in tokens, the crop of ``ref_latent`` a crop edit reads
+  compose          {"base", "box", "as"}: paste a crop edit's tokens into ``base`` and store the result
+  progressive      the first N steps run at half width and height
 """
 
 from __future__ import annotations
@@ -135,6 +140,16 @@ class FiboPipelineConfig(Flux2PipelineConfig):
     def post_denoising_loop(self, latents, batch):
         batch.extra.pop("fibo_cond", None)
         h, w = batch.height // 16, batch.width // 16
+        opts = options(batch)
+        if opts.get("store_output_as") or opts.get("compose"):
+            from multi_turn import state
+            from multi_turn.pipeline.hooks import _compose
+
+            if opts.get("store_output_as"):
+                state.OUTPUT_LATENTS.put(opts["store_output_as"], latents[:1].detach().to(torch.bfloat16).clone())
+                state.OUTPUT_GRID[opts["store_output_as"]] = (h, w)
+            if opts.get("compose"):
+                _compose(opts["compose"], latents[:1], (h, w))
         return latents.transpose(1, 2).reshape(latents.shape[0], -1, h, w)
 
     def preprocess_condition_image(self, image, *args, **kwargs):
@@ -197,6 +212,12 @@ class FiboEncodingStage(PipelineStage):
         boxes = options(batch).get("mask_boxes")
         if boxes and images:
             images[0] = grey_out(images[0], boxes)
+        opts = options(batch)
+        stored = None
+        if opts.get("ref_latent") and not boxes:
+            from multi_turn import state
+
+            stored = state.stored_latents(opts["ref_latent"], opts.get("ref_latent_crop"))
         crops = [resize_and_crop(im, batch.width, batch.height) for im in images[:1]]
         crops += [resize_and_crop(im, *_trained_size(im)) for im in images[1:]]
         vlm_images = []
@@ -210,9 +231,15 @@ class FiboEncodingStage(PipelineStage):
             embeds = self.encode_prompt(prompt, vlm_images, device)
         batch.prompt_embeds = [embeds]
         batch.prompt_embeds_mask = None
-        cond = {"latent_hw": (batch.height // 16, batch.width // 16)}
-        if crops:
+        cond = {"latent_hw": [batch.height // 16, batch.width // 16]}
+        if stored is not None and len(crops) == 1:
+            cond["context_tokens"] = stored.to(device)
+            cond["context_hw"] = [(batch.height // 16, batch.width // 16)]
+        elif crops:
             cond["context_tokens"], cond["context_hw"] = self.encode_images(crops, config, device)
+        steps = int(opts.get("progressive") or 0)
+        if steps and not boxes and batch.height % 32 == 0 and batch.width % 32 == 0:
+            batch.extra["fibo_progressive"] = steps
         batch.extra["fibo_cond"] = cond
         sched = self.scheduler.config
         batch.extra["fibo_mu"] = calculate_linear_shift(
@@ -243,6 +270,32 @@ class FiboDenoisingStage(DenoisingStage):
 
         maybe_convert(current_model)
         return super()._predict_noise(current_model, latent_model_input, timestep, target_dtype, guidance, **kwargs)
+
+    def _run_denoising_step(self, ctx, step, batch, server_args):
+        steps = batch.extra.get("fibo_progressive", 0)
+        if step.step_index >= steps:
+            return super()._run_denoising_step(ctx, step, batch, server_args)
+        # as Qwen's progressive path: half-size target first, then upsample x0 and re-noise with the same noise
+        cond = batch.extra["fibo_cond"]
+        H, W = batch.height // 16, batch.width // 16
+        if step.step_index == 0:
+            self._eps = ctx.latents.detach().clone()
+            b, _, c = ctx.latents.shape
+            ctx.latents = ctx.latents.view(b, H, W, c)[:, ::2, ::2].reshape(b, (H // 2) * (W // 2), c).contiguous()
+            cond["latent_hw"][:] = [H // 2, W // 2]  # in place: the denoising kwargs copy the dict, not the list
+        before = ctx.latents
+        result = super()._run_denoising_step(ctx, step, batch, server_args)
+        if step.step_index == steps - 1:
+            sigmas = ctx.scheduler.sigmas
+            s0, s1 = sigmas[step.step_index], sigmas[step.step_index + 1]
+            x0 = ctx.latents - s1 * (ctx.latents - before) / (s1 - s0)
+            b, _, c = x0.shape
+            x0 = x0.view(b, H // 2, W // 2, c).permute(0, 3, 1, 2)
+            x0 = torch.nn.functional.interpolate(x0.float(), size=(H, W), mode="bilinear", align_corners=False)
+            x0 = x0.permute(0, 2, 3, 1).reshape(b, H * W, c).to(ctx.latents.dtype)
+            ctx.latents = (1 - s1) * x0 + s1 * self._eps.to(x0)
+            cond["latent_hw"][:] = [H, W]
+        return result
 
 
 class FiboPipeline(LoRAPipeline, ComposedPipelineBase):
