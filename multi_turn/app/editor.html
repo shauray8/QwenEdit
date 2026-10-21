@@ -29,6 +29,10 @@ header { display: flex; align-items: center; gap: 14px; padding: 0 14px; border-
 .seg button { padding: 5px 12px; border-radius: 7px; color: var(--muted); font-weight: 550; }
 .seg button.on { background: var(--line-2); color: var(--fg); }
 .seg button small { color: var(--dim); font-weight: 450; margin-left: 4px; }
+#modelSeg { margin: 0 0 0 12px; }
+.mtag { display: inline-block; padding: 0 6px; border-radius: 999px; border: 1px solid var(--line-2); font-size: 11px; line-height: 16px; }
+.mtag.fibo { color: #f0a35e; border-color: #f0a35e66; }
+.mtag.qwen { color: #7fb0ff; border-color: #7fb0ff66; }
 .latency { font-variant-numeric: tabular-nums; color: var(--muted); min-width: 88px; text-align: right; }
 .latency b { color: var(--fg); font-weight: 600; }
 .icon-btn { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 8px; color: var(--muted); }
@@ -157,6 +161,7 @@ aside .head h3 { margin: 0 auto 0 0; font-size: 13px; }
       <button data-v="fast">Fast<small>5</small></button>
       <button data-v="draft">Draft<small>4</small></button>
     </div>
+    <div class="seg" id="fiboSteps" hidden title="Fibo 2.0 Edit Turbo runs one 4-step schedule"><button class="on">Turbo<small>4 steps</small></button></div>
     <div class="latency" id="latency"></div>
     <button class="icon-btn" id="settingsBtn" title="Settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></button>
   </header>
@@ -400,8 +405,9 @@ function show(data, { keepBoxes = false } = {}) {
   [...data.order].reverse().forEach((vid) => {
     const v = data.versions[vid], el = document.createElement("button");
     el.className = "ver" + (vid === data.head ? " head-v" : "");
-    const meta = [vid, v.model === "fibo" ? "Fibo" : null, v.seconds ? `${v.seconds.toFixed(2)}s` : null, v.parent && v.parent !== prevOf(data, vid) ? `from ${v.parent}` : null].filter(Boolean).join(" · ");
-    el.innerHTML = `<img loading="lazy" src="${imageUrl(vid, 160)}" alt=""><div><div class="t"></div><div class="m">${meta}</div></div>`;
+    const tag = v.model ? `<span class="mtag ${v.model}">${v.model === "fibo" ? "Fibo" : "Qwen"}</span>` : "";
+    const meta = [vid, v.seconds ? `${v.seconds.toFixed(2)}s` : null, v.parent && v.parent !== prevOf(data, vid) ? `from ${v.parent}` : null].filter(Boolean).join(" · ");
+    el.innerHTML = `<img loading="lazy" src="${imageUrl(vid, 160)}" alt=""><div><div class="t"></div><div class="m">${tag} ${meta}</div></div>`;
     el.querySelector(".t").textContent = summary(v);
     el.onclick = () => run(() => api(`/api/sessions/${data.id}/checkout`, { version: vid }), null);
     list.append(el);
@@ -436,7 +442,7 @@ function fetchFull(vid) {
 function showLatency() {
   const head = S.session?.versions[S.session.head];
   if (!head || !head.seconds) { $("latency").innerHTML = ""; return; }
-  $("latency").innerHTML = `<b>${head.seconds.toFixed(2)}s</b> generate` + (S.totalSec ? ` · <b>${S.totalSec.toFixed(1)}s</b> total` : "");
+  $("latency").innerHTML = (head.model ? `<span class="mtag ${head.model}">${head.model === "fibo" ? "Fibo" : "Qwen"}</span> ` : "") + `<b>${head.seconds.toFixed(2)}s</b> generate` + (S.totalSec ? ` · <b>${S.totalSec.toFixed(1)}s</b> total` : "");
 }
 
 async function run(fn, label = "Editing") {
@@ -571,6 +577,7 @@ document.addEventListener("keyup", (e) => { if (e.key === " " && S.compare) comp
     S.model = m;
     $("modelSeg").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x.dataset.v === m));
     $("speed").hidden = m !== "qwen";  // Fibo Turbo has one 4-step schedule
+    $("fiboSteps").hidden = m === "qwen";
   };
   if (S.config.models.length > 1) {
     $("model").hidden = true; $("modelSeg").hidden = false;
