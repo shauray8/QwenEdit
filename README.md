@@ -11,10 +11,18 @@ Edit latency on an RTX PRO 6000 (NVFP4, 8 steps): 1K full image 0.9 s, 2K full i
 Fibo 2.0 Edit Turbo on an RTX 5090 (NVFP4, Sage2, 4 steps, always at its trained ~1 MP), seconds per edit in the
 playground, warm:
 
-| Session | Full image | Box edit |
+| Session | Start (`f33f49c`) | Full image (`master`) | Box edit (`master`) |
+|---|---|---|---|
+| 1K (1184×896) | 2.18 s | 1.29 s | 1.33 s |
+| 2K (2368×1760) | 2.40 s | 1.62 s | 1.66 s |
+
+The Fibo speed work started on `f33f49c`. On `master` it is these commits:
+
+| Commit | Change | 1K edit |
 |---|---|---|
-| 1K (1184×896) | 1.29 s | 1.33 s |
-| 2K (2368×1760) | 1.62 s | 1.66 s |
+| `436cbb6` | Perceiver and cross-attention K/V once per request | 2.18 s |
+| `fc2e6ef` | Compiled norm, modulation, gate and RoPE glue (`MULTI_TURN_FIBO_COMPILE`) | 1.36 s |
+| `cbc97f6` | NVFP4 quantization fused into RMSNorm+adaLN and SiLU·mul (Triton) | 1.33 s |
 
 The first edit at a new size adds ~5 s while the fused kernels compile.
 
