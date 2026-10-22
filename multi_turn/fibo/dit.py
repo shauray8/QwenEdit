@@ -119,9 +119,17 @@ class Attention(nn.Module):
         kv_shape = (*context.shape[:-1], self.heads, self.head_dim)
         return self.to_q(x).view(shape), self.to_k(context).view(kv_shape), self.to_v(context).view(kv_shape)
 
-    def forward(self, x, context=None, mask=None, freqs_cis=None):
-        q, k, v = self.project_qkv(x, x if context is None else context)
-        q, k = self.norm_q(q), self.norm_k(k)
+    def context_kv(self, context):
+        """Normalized K and V of a cross-attention context, reusable while the context stays the same."""
+        kv_shape = (*context.shape[:-1], self.heads, self.head_dim)
+        return self.norm_k(self.to_k(context).view(kv_shape)), self.to_v(context).view(kv_shape)
+
+    def forward(self, x, context=None, mask=None, freqs_cis=None, context_kv=None):
+        if context_kv is None:
+            q, k, v = self.project_qkv(x, x if context is None else context)
+            q, k = self.norm_q(q), self.norm_k(k)
+        else:
+            q, (k, v) = self.norm_q(self.to_q(x).view(*x.shape[:-1], self.heads, self.head_dim)), context_kv
         if freqs_cis is not None:
             q, k = _rope(q, freqs_cis), _rope(k, freqs_cis)
         if self.attn is not None and mask is None:
@@ -165,12 +173,12 @@ class Block(nn.Module):
         scale_msa, gate_msa, scale_mlp, gate_mlp = mods
         return 1 + scale_msa, gate_msa.tanh(), 1 + scale_mlp, gate_mlp.tanh()
 
-    def forward(self, x, freqs_cis, adaln_noisy, adaln_clean, noise_mask, mask=None, text=None, text_mask=None):
+    def forward(self, x, freqs_cis, adaln_noisy, adaln_clean, noise_mask, mask=None, text_kv=None):
         scale_msa, gate_msa, scale_mlp, gate_mlp = self.modulation(adaln_noisy, adaln_clean, noise_mask)
         attn = self.attention(self.attention_norm1(x) * scale_msa, mask=mask, freqs_cis=freqs_cis)
         x = x + gate_msa * self.attention_norm2(attn)
         if self.cross_attention is not None:
-            cross = self.cross_attention(self.cross_attn_norm1(x), context=text, mask=text_mask)
+            cross = self.cross_attention(self.cross_attn_norm1(x), context_kv=text_kv)
             x = x + self.cross_attn_gate.tanh() * self.cross_attn_norm2(cross)
         return x + gate_mlp * self.ffn_norm2(self.feed_forward(self.ffn_norm1(x) * scale_mlp))
 
@@ -268,10 +276,11 @@ class FiboTransformer2DModel(CachableDiT):
         self._bundle = {layer: i + 1 for i, layer in enumerate(c.injection_layer_ids)}
 
     def forward(self, hidden_states, encoder_hidden_states, timestep, latent_hw=None, context_tokens=None,
-                context_hw=None, guidance=None, **kwargs):
+                context_hw=None, guidance=None, text_cache=None, **kwargs):
         """``hidden_states`` [B, N, 128] packed latent tokens at ``latent_hw`` (in tokens); ``encoder_hidden_states``
         [B, 6, T, 7680] text bundles; ``context_tokens`` [B, Nc, 128] for the images to edit, laid out at
-        ``context_hw``; ``timestep`` is SGLang's sigma * 1000."""
+        ``context_hw``; ``timestep`` is SGLang's sigma * 1000. ``text_cache``, a dict kept across a request's steps,
+        holds the Perceiver output and the injection blocks' K/V, which depend only on the text."""
         c = self.config
         if isinstance(encoder_hidden_states, (list, tuple)):
             encoder_hidden_states = encoder_hidden_states[0]
@@ -300,15 +309,19 @@ class FiboTransformer2DModel(CachableDiT):
 
         text = encoder_hidden_states.to(dtype)
         n_gist = gist_count(text.shape[2], c)
-        gist = self.perceiver(text[:, 0], n_gist)
+        cache = {} if text_cache is None else text_cache
+        if "gist" not in cache:
+            cache["gist"] = self.perceiver(text[:, 0], n_gist)
+            cache["kv"] = {i: self.layers[i].cross_attention.context_kv(text[:, bundle])
+                           for i, bundle in self._bundle.items()}
+        gist = cache["gist"]
         gist_freqs = self.rope_embedder(_grid((n_gist, 1, 1), (1, 0, 0), device)).unsqueeze(0)
         x = torch.cat([gist, x], dim=1)
         freqs = torch.cat([gist_freqs, image_freqs], dim=1)
         noise_mask = torch.zeros(x.shape[1], dtype=torch.bool, device=device)
         noise_mask[n_gist:n_gist + n_image] = True
         for i, block in enumerate(self.layers):
-            bundle = self._bundle.get(i)
-            x = block(x, freqs, adaln_noisy, adaln_clean, noise_mask, text=None if bundle is None else text[:, bundle])
+            x = block(x, freqs, adaln_noisy, adaln_clean, noise_mask, text_kv=cache["kv"].get(i))
         return self.final_layer(x[:, n_gist:n_gist + n_image], adaln_noisy).float()
 
 

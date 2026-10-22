@@ -313,7 +313,8 @@ class FiboEncodingStage(PipelineStage):
             embeds = self.encode_prompt(prompt, vlm_images, device)
         batch.prompt_embeds = [embeds]
         batch.prompt_embeds_mask = None
-        cond = {"latent_hw": [batch.height // 16, batch.width // 16]}
+        # text_cache: the DiT fills it on the first step with what depends only on the text, reused by later steps
+        cond = {"latent_hw": [batch.height // 16, batch.width // 16], "text_cache": {}}
         if stored is not None and len(crops) == 1:
             cond["context_tokens"] = stored.to(device)
             cond["context_hw"] = [(batch.height // 16, batch.width // 16)]
