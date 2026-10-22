@@ -1,12 +1,15 @@
 """Fibo 2.0 DiT for SGLang-Diffusion: a port of diffusers' ``BriaFibo2Transformer2DModel``.
 
 Parameter names match the checkpoint. Self-attention runs through SGLang's ``USPAttention`` (Sage, FA, SDPA);
-the Perceiver and the injection cross-attentions are small and use SDPA.
+the Perceiver and the injection cross-attentions are small and use SDPA. The elementwise glue (RMSNorm, adaLN
+modulation, gates, RoPE) is ~60% of a step in eager mode, so it runs through ``torch.compile``d helpers
+(MULTI_TURN_FIBO_COMPILE=0 keeps it eager).
 """
 
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -18,6 +21,37 @@ from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 
 ADALN_EMBED_DIM = 256
+COMPILE = os.environ.get("MULTI_TURN_FIBO_COMPILE", "1") == "1"
+
+
+def _compiled(fn):
+    return torch.compile(fn, dynamic=True) if COMPILE else fn
+
+
+def _rms_norm_eager(x, weight, eps):
+    # rounds to the weight's dtype before the scale, as diffusers' RMSNorm does
+    x = x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
+    return x.to(weight.dtype) * weight
+
+
+def _mod(noisy, clean, noise_mask):
+    # per-token adaLN values: the timestep's on the tokens being generated, t=0's on the clean context tokens
+    if noise_mask is None:
+        return noisy[:, None]
+    return torch.where(noise_mask[None, :, None], noisy[:, None], clean[:, None])
+
+
+_rms_norm = _compiled(_rms_norm_eager)
+
+
+@_compiled
+def _norm_scale(x, weight, eps, noisy, clean, noise_mask):
+    return _rms_norm_eager(x, weight, eps) * (1 + _mod(noisy, clean, noise_mask))
+
+
+@_compiled
+def _gated_residual(x, y, weight, eps, noisy, clean, noise_mask):
+    return x + _mod(noisy, clean, noise_mask).tanh() * _rms_norm_eager(y, weight, eps)
 
 
 @dataclass
@@ -64,9 +98,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        # rounds to the weight's dtype before the scale, as diffusers' RMSNorm does
-        x = x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
-        return x.to(self.weight.dtype) * self.weight
+        return _rms_norm(x, self.weight, self.eps)
 
 
 class TimestepEmbedder(nn.Module):
@@ -91,12 +123,23 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2(silu_mul(self.w1(x), self.w3(x)))
 
 
-def _rope(x, freqs_cis):
+@_compiled
+def silu_mul(gate, value):
+    return F.silu(gate) * value
+
+
+def _rope_eager(x, freqs_cis):
     out = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2)) * freqs_cis.unsqueeze(2)
     return torch.view_as_real(out).flatten(3).type_as(x)
+
+
+@_compiled
+def _norm_rope(x, weight, eps, freqs_cis):
+    x = _rms_norm_eager(x, weight, eps)
+    return x if freqs_cis is None else _rope_eager(x, freqs_cis)
 
 
 class Attention(nn.Module):
@@ -127,11 +170,10 @@ class Attention(nn.Module):
     def forward(self, x, context=None, mask=None, freqs_cis=None, context_kv=None):
         if context_kv is None:
             q, k, v = self.project_qkv(x, x if context is None else context)
-            q, k = self.norm_q(q), self.norm_k(k)
+            k = _norm_rope(k, self.norm_k.weight, self.norm_k.eps, freqs_cis)
         else:
-            q, (k, v) = self.norm_q(self.to_q(x).view(*x.shape[:-1], self.heads, self.head_dim)), context_kv
-        if freqs_cis is not None:
-            q, k = _rope(q, freqs_cis), _rope(k, freqs_cis)
+            q, (k, v) = self.to_q(x).view(*x.shape[:-1], self.heads, self.head_dim), context_kv
+        q = _norm_rope(q, self.norm_q.weight, self.norm_q.eps, freqs_cis)
         if self.attn is not None and mask is None:
             out = self.attn(q, k, v)
         else:
@@ -140,10 +182,6 @@ class Attention(nn.Module):
             out = out.transpose(1, 2)
         return self.to_out[0](out.flatten(2))
 
-
-def _select(noisy, clean, noise_mask):
-    # noise_mask: [S] bool, True on the tokens being generated
-    return torch.where(noise_mask[None, :, None], noisy[:, None], clean[:, None])
 
 
 class Block(nn.Module):
@@ -163,24 +201,25 @@ class Block(nn.Module):
             self.cross_attn_norm2 = RMSNorm(dim, eps)
             self.cross_attn_gate = nn.Parameter(torch.zeros(1))
 
-    def modulation(self, adaln_noisy, adaln_clean, noise_mask):
+    def modulation(self, adaln_noisy, adaln_clean):
+        """``(scale_msa, gate_msa, scale_mlp, gate_mlp)`` as (noisy, clean) pairs, selected per token later."""
         noisy = self.adaLN_modulation(adaln_noisy).chunk(4, dim=1)
-        if noise_mask is None:
-            mods = [m[:, None] for m in noisy]
-        else:
-            clean = self.adaLN_modulation(adaln_clean).chunk(4, dim=1)
-            mods = [_select(n, c, noise_mask) for n, c in zip(noisy, clean)]
-        scale_msa, gate_msa, scale_mlp, gate_mlp = mods
-        return 1 + scale_msa, gate_msa.tanh(), 1 + scale_mlp, gate_mlp.tanh()
+        clean = self.adaLN_modulation(adaln_clean).chunk(4, dim=1) if adaln_clean is not None else noisy
+        return list(zip(noisy, clean))
 
     def forward(self, x, freqs_cis, adaln_noisy, adaln_clean, noise_mask, mask=None, text_kv=None):
-        scale_msa, gate_msa, scale_mlp, gate_mlp = self.modulation(adaln_noisy, adaln_clean, noise_mask)
-        attn = self.attention(self.attention_norm1(x) * scale_msa, mask=mask, freqs_cis=freqs_cis)
-        x = x + gate_msa * self.attention_norm2(attn)
+        scale_msa, gate_msa, scale_mlp, gate_mlp = self.modulation(adaln_noisy,
+                                                                   None if noise_mask is None else adaln_clean)
+        n1, n2 = self.attention_norm1, self.attention_norm2
+        attn = self.attention(_norm_scale(x, n1.weight, n1.eps, *scale_msa, noise_mask), mask=mask, freqs_cis=freqs_cis)
+        x = _gated_residual(x, attn, n2.weight, n2.eps, *gate_msa, noise_mask)
         if self.cross_attention is not None:
             cross = self.cross_attention(self.cross_attn_norm1(x), context_kv=text_kv)
-            x = x + self.cross_attn_gate.tanh() * self.cross_attn_norm2(cross)
-        return x + gate_mlp * self.ffn_norm2(self.feed_forward(self.ffn_norm1(x) * scale_mlp))
+            gate = self.cross_attn_gate.view(1, 1)
+            x = _gated_residual(x, cross, self.cross_attn_norm2.weight, self.cross_attn_norm2.eps, gate, gate, None)
+        f1, f2 = self.ffn_norm1, self.ffn_norm2
+        ffn = self.feed_forward(_norm_scale(x, f1.weight, f1.eps, *scale_mlp, noise_mask))
+        return _gated_residual(x, ffn, f2.weight, f2.eps, *gate_mlp, noise_mask)
 
 
 class PerceiverLayer(nn.Module):

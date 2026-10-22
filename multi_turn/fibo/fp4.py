@@ -9,9 +9,9 @@ from __future__ import annotations
 import logging
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
+from multi_turn.fibo.dit import silu_mul
 from multi_turn.pipeline.fp4 import ENABLED, NVFP4Linear
 
 logger = logging.getLogger(__name__)
@@ -39,7 +39,7 @@ def _project_qkv(attn, packed):
 def _ffn_forward(packed, w2):
     def forward(x):
         gate, value = packed.outputs(x)
-        return w2(F.silu(gate) * value)
+        return w2(silu_mul(gate, value))
 
     return forward
 

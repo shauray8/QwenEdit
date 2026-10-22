@@ -7,7 +7,8 @@ https://github.com/user-attachments/assets/bb136139-1d88-4300-8d26-4bbef5d2a13c
 
 
 Edit latency on an RTX PRO 6000 (NVFP4, 8 steps): 1K full image 0.9 s, 2K full image 4.4 s, 2K box edit 3.9–5.2 s, small box 0.4–1 s.
-Fibo 2.0 Edit Turbo (NVFP4, 4 steps, always at its trained ~1 MP): full image 2.2 s, box edit 2.2–2.4 s at 1K and 2K.
+Fibo 2.0 Edit Turbo (NVFP4, 4 steps, always at its trained ~1 MP): full image 1.4 s, box edit 1.4 s at 1K, 1.6 s at 2K
+(RTX 5090).
 
 
 ## Install
@@ -71,6 +72,7 @@ make enhancer   # prompt enhancer       -> --enhancer-url http://127.0.0.1:30000
 | `MULTI_TURN_ENCODER_CACHE` | `1` | text-encoder prefix reuse |
 | `MULTI_TURN_LOCK` | `0.75` | box-edit change lock sigma, `0` disables |
 | `MULTI_TURN_DEBUG` | `0` | log cache reuse per request |
+| `MULTI_TURN_FIBO_COMPILE` | `1` | `torch.compile` Fibo's norms, modulation and RoPE, `0` keeps them eager |
 
 Running the resolver or enhancer on the same GPU: lower the caches, e.g. `MULTI_TURN_KV_GPU_GIB=16 MULTI_TURN_ENC_GPU_GIB=3`.
 
