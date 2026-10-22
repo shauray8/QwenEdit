@@ -71,6 +71,10 @@ class NVFP4Linear(nn.Module):
         xq, xsf, gx = self.act(x2)
         return [w.mm(xq, xsf, gx).view(*shape[:-1], w.n) for w in self.weights]
 
+    def quantized_outputs(self, xq, xsf, shape):
+        """``outputs`` for an activation already quantized with this layer's scale (``self.act.scale``)."""
+        return [w.mm(xq, xsf, self.act.scale).view(*shape[:-1], w.n) for w in self.weights]
+
     def forward(self, x):
         out = self.outputs(x)[0]
         if self.bias is not None:

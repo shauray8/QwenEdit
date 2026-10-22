@@ -207,18 +207,25 @@ class Block(nn.Module):
         clean = self.adaLN_modulation(adaln_clean).chunk(4, dim=1) if adaln_clean is not None else noisy
         return list(zip(noisy, clean))
 
+    def attn_input(self, x, mods, noise_mask):
+        """Self-attention input: RMSNorm, then the adaLN scale. NVFP4 conversion swaps in a version that quantizes."""
+        return _norm_scale(x, self.attention_norm1.weight, self.attention_norm1.eps, *mods, noise_mask)
+
+    def ffn_input(self, x, mods, noise_mask):
+        return _norm_scale(x, self.ffn_norm1.weight, self.ffn_norm1.eps, *mods, noise_mask)
+
     def forward(self, x, freqs_cis, adaln_noisy, adaln_clean, noise_mask, mask=None, text_kv=None):
         scale_msa, gate_msa, scale_mlp, gate_mlp = self.modulation(adaln_noisy,
                                                                    None if noise_mask is None else adaln_clean)
-        n1, n2 = self.attention_norm1, self.attention_norm2
-        attn = self.attention(_norm_scale(x, n1.weight, n1.eps, *scale_msa, noise_mask), mask=mask, freqs_cis=freqs_cis)
+        n2 = self.attention_norm2
+        attn = self.attention(self.attn_input(x, scale_msa, noise_mask), mask=mask, freqs_cis=freqs_cis)
         x = _gated_residual(x, attn, n2.weight, n2.eps, *gate_msa, noise_mask)
         if self.cross_attention is not None:
             cross = self.cross_attention(self.cross_attn_norm1(x), context_kv=text_kv)
             gate = self.cross_attn_gate.view(1, 1)
             x = _gated_residual(x, cross, self.cross_attn_norm2.weight, self.cross_attn_norm2.eps, gate, gate, None)
-        f1, f2 = self.ffn_norm1, self.ffn_norm2
-        ffn = self.feed_forward(_norm_scale(x, f1.weight, f1.eps, *scale_mlp, noise_mask))
+        f2 = self.ffn_norm2
+        ffn = self.feed_forward(self.ffn_input(x, scale_mlp, noise_mask))
         return _gated_residual(x, ffn, f2.weight, f2.eps, *gate_mlp, noise_mask)
 
 

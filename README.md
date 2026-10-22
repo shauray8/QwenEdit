@@ -7,7 +7,7 @@ https://github.com/user-attachments/assets/bb136139-1d88-4300-8d26-4bbef5d2a13c
 
 
 Edit latency on an RTX PRO 6000 (NVFP4, 8 steps): 1K full image 0.9 s, 2K full image 4.4 s, 2K box edit 3.9–5.2 s, small box 0.4–1 s.
-Fibo 2.0 Edit Turbo (NVFP4, 4 steps, always at its trained ~1 MP): full image 1.4 s, box edit 1.4 s at 1K, 1.6 s at 2K
+Fibo 2.0 Edit Turbo (NVFP4, 4 steps, always at its trained ~1 MP): full image and box edit 1.3 s at 1K, 1.5–1.6 s at 2K
 (RTX 5090).
 
 
